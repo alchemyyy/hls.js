@@ -359,6 +359,20 @@ export class FragmentTracker implements ComponentAPI {
     return bestFragment;
   }
 
+  public updateEndListFragments(
+    lastFragment: MediaFragment,
+  ): FragmentEntity | undefined {
+    const fragKey = getFragmentKey(lastFragment);
+    const fragmentEntity = this.fragments[fragKey];
+    if (fragmentEntity) {
+      fragmentEntity.body.endList = true;
+      if (fragmentEntity.buffered || isPartial(fragmentEntity)) {
+        this.endListFragments[fragmentEntity.body.type] = fragmentEntity;
+      }
+    }
+    return fragmentEntity;
+  }
+
   public isEndListAppended(type: PlaylistLevelType): boolean {
     const lastFragmentEntity = this.endListFragments[type];
     return (

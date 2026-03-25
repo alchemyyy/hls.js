@@ -644,6 +644,11 @@ export default class BaseStreamController
         stats: lastFragment.stats,
         id: lastFragment.type,
       });
+      // Ensure endListFragments is set for the last fragment, which may
+      // already be buffered under a stale entity that predates the
+      // ENDLIST tag. detectPartialFragments can bail before reaching
+      // bufferedEnd, so update endListFragments directly.
+      this.fragmentTracker.updateEndListFragments(lastFragment);
     }
     if (!details.fragments[0]) {
       details.deltaUpdateFailed = true;
