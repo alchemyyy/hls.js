@@ -12,6 +12,7 @@ import Transmuxer, {
 } from '../demux/transmuxer';
 import { ErrorDetails, ErrorTypes } from '../errors';
 import { Events } from '../events';
+import { getChunkMetadataPlaylistOffset } from '../types/transmuxer';
 import { getM2TSSupportedAudioTypes } from '../utils/codecs';
 import { stringify } from '../utils/safe-json-stringify';
 import type { WorkerContext } from './inject-worker';
@@ -225,6 +226,7 @@ export default class TransmuxerInterface {
     const initSegmentChange = !(
       lastFrag && frag.initSegment?.url === lastFrag.initSegment?.url
     );
+    const playlistOffset = getChunkMetadataPlaylistOffset(chunkMeta);
     const state = new TransmuxState(
       discontinuity,
       contiguous,
@@ -232,6 +234,7 @@ export default class TransmuxerInterface {
       trackSwitch,
       timeOffset,
       initSegmentChange,
+      playlistOffset,
     );
     if (!contiguous || discontinuity || initSegmentChange) {
       this.hls.logger

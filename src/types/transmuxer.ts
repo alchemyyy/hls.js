@@ -2,6 +2,21 @@ import type { SourceBufferName } from './buffer';
 import type { HlsChunkPerformanceTiming } from './loader';
 import type { RemuxerResult } from './remuxer';
 
+const chunkMetadataPlaylistOffsets = new WeakMap<ChunkMetadata, number>();
+
+export function setChunkMetadataPlaylistOffset(
+  chunkMeta: ChunkMetadata,
+  playlistOffset: number,
+): void {
+  chunkMetadataPlaylistOffsets.set(chunkMeta, playlistOffset);
+}
+
+export function getChunkMetadataPlaylistOffset(
+  chunkMeta: ChunkMetadata,
+): number | undefined {
+  return chunkMetadataPlaylistOffsets.get(chunkMeta);
+}
+
 export interface TransmuxerResult {
   remuxResult: RemuxerResult;
   chunkMeta: ChunkMetadata;

@@ -104,6 +104,7 @@ export default class Transmuxer {
       this.currentTransmuxState = state;
     }
 
+    const transmuxState = state || currentTransmuxState;
     const {
       contiguous,
       discontinuity,
@@ -111,7 +112,8 @@ export default class Transmuxer {
       accurateTimeOffset,
       timeOffset,
       initSegmentChange,
-    } = state || currentTransmuxState;
+      playlistOffset,
+    } = transmuxState;
     const {
       audioCodec,
       videoCodec,
@@ -136,7 +138,12 @@ export default class Transmuxer {
         .then((decryptedData) => {
           // Calling push here is important; if flush() is called while this is still resolving, this ensures that
           // the decrypted data has been transmuxed
-          const result = this.push(decryptedData, null, chunkMeta);
+          const result = this.push(
+            decryptedData,
+            null,
+            chunkMeta,
+            transmuxState,
+          );
           this.decryptionPromise = null;
           return result;
         });
@@ -194,6 +201,7 @@ export default class Transmuxer {
       timeOffset,
       accurateTimeOffset,
       chunkMeta,
+      playlistOffset,
     );
     this.asyncResult = isPromise(result);
 
@@ -277,7 +285,8 @@ export default class Transmuxer {
       return;
     }
     const { audioTrack, videoTrack, id3Track, textTrack } = demuxResult;
-    const { accurateTimeOffset, timeOffset } = this.currentTransmuxState;
+    const { accurateTimeOffset, playlistOffset, timeOffset } =
+      this.currentTransmuxState;
     this.logger.log(
       `[transmuxer.ts]: Flushed ${this.id} sn: ${chunkMeta.sn}${
         chunkMeta.part > -1 ? ' part: ' + chunkMeta.part : ''
@@ -293,6 +302,7 @@ export default class Transmuxer {
       true,
       this.id,
       chunkMeta,
+      playlistOffset,
     );
     transmuxResults.push({
       remuxResult,
@@ -372,6 +382,7 @@ export default class Transmuxer {
     timeOffset: number,
     accurateTimeOffset: boolean,
     chunkMeta: ChunkMetadata,
+    playlistOffset?: number,
   ): TransmuxerResult | Promise<TransmuxerResult> {
     let result: TransmuxerResult | Promise<TransmuxerResult>;
     if (keyData?.method === 'SAMPLE-AES') {
@@ -381,6 +392,7 @@ export default class Transmuxer {
         timeOffset,
         accurateTimeOffset,
         chunkMeta,
+        playlistOffset,
       );
     } else {
       result = this.transmuxUnencrypted(
@@ -388,6 +400,7 @@ export default class Transmuxer {
         timeOffset,
         accurateTimeOffset,
         chunkMeta,
+        playlistOffset,
       );
     }
     return result;
@@ -398,6 +411,7 @@ export default class Transmuxer {
     timeOffset: number,
     accurateTimeOffset: boolean,
     chunkMeta: ChunkMetadata,
+    playlistOffset?: number,
   ): TransmuxerResult {
     const { demuxer, remuxer } = this;
     if (!demuxer || !remuxer) {
@@ -420,6 +434,7 @@ export default class Transmuxer {
       false,
       this.id,
       chunkMeta,
+      playlistOffset,
     );
     return {
       remuxResult,
@@ -433,6 +448,7 @@ export default class Transmuxer {
     timeOffset: number,
     accurateTimeOffset: boolean,
     chunkMeta: ChunkMetadata,
+    playlistOffset?: number,
   ): Promise<TransmuxerResult> {
     if (!this.demuxer) {
       return Promise.reject(new Error('no demuxer'));
@@ -450,6 +466,7 @@ export default class Transmuxer {
           false,
           this.id,
           chunkMeta,
+          playlistOffset,
         );
         return {
           remuxResult,
@@ -563,6 +580,7 @@ export class TransmuxState {
   public trackSwitch: boolean;
   public timeOffset: number;
   public initSegmentChange: boolean;
+  public playlistOffset: number | undefined;
 
   constructor(
     discontinuity: boolean,
@@ -571,6 +589,7 @@ export class TransmuxState {
     trackSwitch: boolean,
     timeOffset: number,
     initSegmentChange: boolean,
+    playlistOffset?: number,
   ) {
     this.discontinuity = discontinuity;
     this.contiguous = contiguous;
@@ -578,5 +597,6 @@ export class TransmuxState {
     this.trackSwitch = trackSwitch;
     this.timeOffset = timeOffset;
     this.initSegmentChange = initSegmentChange;
+    this.playlistOffset = playlistOffset;
   }
 }

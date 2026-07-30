@@ -25,6 +25,7 @@ export interface Remuxer {
     flush: boolean,
     playlistType: PlaylistLevelType,
     chunkMeta: ChunkMetadata,
+    playlistOffset?: number,
   ): RemuxerResult;
   resetInitSegment(
     initSegment: Uint8Array | undefined,

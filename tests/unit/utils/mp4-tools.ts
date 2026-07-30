@@ -9,8 +9,10 @@ import {
   getSampleData,
   parseInitSegment,
   remuxVideoOnlyIFrameMoof,
+  repairVideoTimestampCollisions,
   types,
   videoOnlyInitSegment,
+  writeUint32,
 } from '../../../src/utils/mp4-tools';
 import type { TrackFragmentSample } from '../../../src/remux/mp4-generator';
 import type { InitData } from '../../../src/utils/mp4-tools';
@@ -79,6 +81,363 @@ describe('mp4-tools', function () {
     expect(track.ptsMax).to.equal(500 + 1001);
   });
 
+  it('repairs a segment-opening video PTS collision using the missing frame interval', function () {
+    const fragment = timestampCollisionFragment(1984);
+    const parsedSamples = getSampleData(
+      fragment,
+      initData(),
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+
+    expect(parsedSamples[1].trun[0].samples[0].cts).to.equal(1984);
+    expect(
+      repairVideoTimestampCollisions(fragment, parsedSamples[1], 4000, logger),
+    ).to.equal(true);
+
+    const repairedSamples = getSampleData(
+      fragment,
+      initData(),
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+    expect(repairedSamples[1].trun[0].samples[0].cts).to.equal(4000);
+  });
+
+  it('does not rewrite a segment-opening video PTS without a collision', function () {
+    const fragment = timestampCollisionFragment(6000);
+    const parsedSamples = getSampleData(
+      fragment,
+      initData(),
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+
+    expect(
+      repairVideoTimestampCollisions(fragment, parsedSamples[1], 4000, logger),
+    ).to.equal(false);
+    expect(parsedSamples[1].trun[0].samples[0].cts).to.equal(6000);
+  });
+
+  it('leaves valid H.264 open-GOP presentation reordering unchanged', function () {
+    const fragment = timingFragment(
+      [6006, 0, 3003, 15015, 9009, 12012, 24024, 18018, 21021],
+      new Array<number>(9).fill(3003),
+    );
+
+    expectNoTimestampRepair(fragment, initData('avc1.640028', 90000), 1, 6006);
+  });
+
+  it('leaves valid HEVC CRA and RASL presentation reordering unchanged', function () {
+    const fragment = timingFragment(
+      [12000, 0, 3000, 6000, 9000, 27000, 15000, 18000, 21000, 24000],
+      new Array<number>(10).fill(3000),
+    );
+
+    expectNoTimestampRepair(
+      fragment,
+      initData('hvc1.1.6.L120.B0', 90000),
+      1,
+      12000,
+    );
+  });
+
+  it('leaves variable-frame-rate presentation timing unchanged', function () {
+    const fragment = timingFragment(
+      [80, 0, 40, 260, 160, 200],
+      [40, 40, 80, 40, 60, 20],
+    );
+
+    expectNoTimestampRepair(fragment, initData('avc1.640028', 1000), 1, 80);
+  });
+
+  it('leaves deep B-frame presentation reordering unchanged', function () {
+    const fragment = timingFragment(
+      [
+        7000, 0, 1000, 2000, 3000, 4000, 5000, 6000, 15000, 8000, 9000, 10000,
+        11000, 12000, 13000, 14000,
+      ],
+      new Array<number>(16).fill(1000),
+    );
+
+    expectNoTimestampRepair(fragment, initData(), 1, 7000);
+  });
+
+  it('does not infer a missing frame from small-timescale rounding alone', function () {
+    const fragment = timingFragment(
+      [100, 108, 141, 175, 208, 242],
+      [33, 34, 33, 34, 33, 34],
+    );
+
+    expectNoTimestampRepair(fragment, initData('avc1.640028', 1000), 1, 167);
+  });
+
+  it('does not repair an exact duplicate PTS without a missing interval', function () {
+    const fragment = timingFragment(
+      [4000, 4000, 5000, 6000, 7000, 8000],
+      new Array<number>(6).fill(1000),
+    );
+
+    expectNoTimestampRepair(fragment, initData(), 1, 6000);
+  });
+
+  it('does not repair a PTS interval explained by a long-duration sample', function () {
+    const fragment = timingFragment(
+      [4000, 4000, 5000, 8000, 7000, 9000],
+      [1000, 1000, 2000, 1000, 1000, 1000],
+    );
+
+    expectNoTimestampRepair(fragment, initData(), 1, 6000);
+  });
+
+  it('repairs quantized open-GOP timing when decode and presentation duration order differ', function () {
+    const fragment = timingFragment(
+      [2672, 2688, 3360, 6016, 4688, 5360, 8032, 6688, 7360, 10032, 8688, 9360],
+      [688, 656, 672, 672, 672, 656, 672, 672, 656, 672, 672, 672],
+    );
+    const parsedSamples = getSampleData(
+      fragment,
+      initData(),
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+
+    expect(
+      repairVideoTimestampCollisions(fragment, parsedSamples[1], 4016, logger),
+    ).to.equal(true);
+  });
+
+  it('does not repair a collision on a non-sync opening sample', function () {
+    const samples = timingSamples(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    samples[0].flags.isNonSync = 1;
+    const fragment = fragmentFromSamples(samples);
+
+    expectNoTimestampRepair(fragment, initData(), 1, 4000);
+  });
+
+  it('does not repair an opening sample that depends on another sample', function () {
+    const samples = timingSamples(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    samples[0].flags.dependsOn = 1;
+    const fragment = fragmentFromSamples(samples);
+
+    expectNoTimestampRepair(fragment, initData(), 1, 4000);
+  });
+
+  it('uses first_sample_flags before fragment defaults', function () {
+    const samples = timingSamples(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    const fragment = timedFlagFragment(
+      samples,
+      false,
+      sampleFlags(2, 0),
+      sampleFlags(1, 0),
+    );
+    const parsedSamples = getSampleData(
+      fragment,
+      initData(),
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+
+    expect(
+      repairVideoTimestampCollisions(fragment, parsedSamples[1], 4000, logger),
+    ).to.equal(true);
+  });
+
+  it('uses tfhd default_sample_flags before trex defaults', function () {
+    const samples = timingSamples(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    const fragment = timedFlagFragment(
+      samples,
+      false,
+      undefined,
+      sampleFlags(2, 0),
+    );
+    const data = initData();
+    data[1]!.default!.flags = sampleFlags(1, 0);
+    const parsedSamples = getSampleData(
+      fragment,
+      data,
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+
+    expect(
+      repairVideoTimestampCollisions(fragment, parsedSamples[1], 4000, logger),
+    ).to.equal(true);
+  });
+
+  it('uses trex default_sample_flags when fragment flags are absent', function () {
+    const samples = timingSamples(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    const fragment = timedFlagFragment(samples, false);
+    const data = initData();
+    data[1]!.default!.flags = sampleFlags(1, 0);
+
+    expectNoTimestampRepair(fragment, data, 1, 4000);
+  });
+
+  it('uses per-sample flags before fragment defaults', function () {
+    const samples = timingSamples(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    const fragment = timedFlagFragment(
+      samples,
+      true,
+      undefined,
+      sampleFlags(1, 0),
+    );
+    const parsedSamples = getSampleData(
+      fragment,
+      initData(),
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+
+    expect(
+      repairVideoTimestampCollisions(fragment, parsedSamples[1], 4000, logger),
+    ).to.equal(true);
+  });
+
+  it('does not infer corruption from VFR near-collisions and gaps', function () {
+    const fragment = timingFragment(
+      [100, 108, 141, 240, 207, 273],
+      new Array<number>(6).fill(33),
+    );
+
+    expectNoTimestampRepair(fragment, initData('avc1.640028', 1000), 1, 174);
+  });
+
+  it('repairs opening-collision evidence split across multiple truns', function () {
+    const firstRun = timingSamples(
+      [1984, 2000],
+      new Array<number>(2).fill(1000),
+    );
+    const secondRun = timingSamples(
+      [0, 1000, 3000, 5000],
+      new Array<number>(4).fill(1000),
+      2000,
+    );
+    const fragment = timedTrackFragment([[...firstRun], [...secondRun]]);
+    const parsedSamples = getSampleData(
+      fragment,
+      initData(),
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+
+    expect(
+      repairVideoTimestampCollisions(fragment, parsedSamples[1], 4000, logger),
+    ).to.equal(true);
+
+    const repairedSamples = getSampleData(
+      fragment,
+      initData(),
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+    expect(repairedSamples[1].trun[0].samples[0].cts).to.equal(4000);
+  });
+
+  it('does not treat a later trun as the fragment opening', function () {
+    const firstRun = timingSamples(
+      [0, 1000, 2000],
+      new Array<number>(3).fill(1000),
+    );
+    const laterRun = timingSamples(
+      [6984, 7000, 8000, 11000, 10000, 12000],
+      new Array<number>(6).fill(1000),
+      3000,
+    );
+    const fragment = timedTrackFragment([[...firstRun], [...laterRun]]);
+
+    expectNoTimestampRepair(fragment, initData(), 1, 4000);
+  });
+
+  it('does not treat a second same-track traf as the fragment opening', function () {
+    const openingTrackFragment = timingSamples(
+      [0, 1000, 2000],
+      new Array<number>(3).fill(1000),
+    );
+    const laterTrackFragment = timingSamples(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    const fragment = timedFragment([
+      timedTraf(1, [openingTrackFragment]),
+      timedTraf(1, [laterTrackFragment]),
+    ]);
+
+    expectNoTimestampRepair(fragment, initData(), 1, 4000);
+  });
+
+  it('repairs the first video trun when an audio traf precedes it', function () {
+    const audioSamples = timingSamples(
+      [0, 1024, 2048],
+      new Array<number>(3).fill(1024),
+    );
+    const videoSamples = timingSamples(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    const fragment = timedFragment([
+      timedTraf(1, [audioSamples]),
+      timedTraf(2, [videoSamples]),
+    ]);
+    const data = initData('avc1.640028', 90000, 2);
+    data[1] = {
+      timescale: 48000,
+      type: ElementaryStreamTypes.AUDIO,
+      stsd: {
+        codec: 'mp4a.40.2',
+        encrypted: false,
+        supplemental: undefined,
+      },
+    };
+    const parsedSamples = getSampleData(
+      fragment,
+      data,
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+
+    expect(
+      repairVideoTimestampCollisions(fragment, parsedSamples[2], 4000, logger),
+    ).to.equal(true);
+
+    const repairedSamples = getSampleData(
+      fragment,
+      data,
+      new ChunkMetadata(0, 0, 0),
+      logger,
+    );
+    expect(repairedSamples[2].trun[0].samples[0].cts).to.equal(4000);
+  });
+
+  it('does not repair collision-shaped timing on an audio track', function () {
+    const fragment = timingFragment(
+      [1984, 2000, 0, 1000, 3000, 5000],
+      new Array<number>(6).fill(1000),
+    );
+    const data = initData('mp4a.40.2', 48000);
+    data[1]!.type = ElementaryStreamTypes.AUDIO;
+
+    expectNoTimestampRepair(fragment, data, 1, 4000);
+  });
+
   it('remuxVideoOnlyIFrameMoof truncates a partial mdat to the kept samples', function () {
     const fragment = gopFragment();
     const mdatPayloadOffset = fragment.byteLength - 60;
@@ -142,6 +501,51 @@ describe('mp4-tools', function () {
     expect(truns, 'remaining truns').to.have.lengthOf(1);
     expect(readUint32(truns[0], 4), 'first run count').to.equal(1);
     expect(indexOfFourcc(fragment, 'free')).to.be.greaterThan(0);
+  });
+
+  it('parses a single rate-1 edit-list media time', function () {
+    const initSegment = addVideoEditList(
+      MP4.initSegment([videoInitTrack(1)]),
+      2672,
+    );
+    const parsed = parseInitSegment(initSegment);
+
+    expect(parsed.video?.editListMediaTime).to.equal(2672);
+    expect(parsed[1]?.editListMediaTime).to.equal(2672);
+  });
+
+  it('parses a version-1 single rate-1 edit-list media time', function () {
+    const initSegment = addVideoEditList(
+      MP4.initSegment([videoInitTrack(1)]),
+      2672,
+      1,
+      1,
+      1,
+    );
+    const parsed = parseInitSegment(initSegment);
+
+    expect(parsed.video?.editListMediaTime).to.equal(2672);
+    expect(parsed[1]?.editListMediaTime).to.equal(2672);
+  });
+
+  it('rejects edit lists that cannot map playlist time directly', function () {
+    const baseInitSegment = MP4.initSegment([videoInitTrack(1)]);
+    const invalidInitSegments = [
+      addVideoEditList(baseInitSegment, -1),
+      addVideoEditList(baseInitSegment, 2672, 2),
+      addVideoEditList(baseInitSegment, 2672, 1, 0),
+      addVideoEditList(baseInitSegment, 2 ** 32, 1, 1, 1),
+    ];
+
+    for (
+      let segmentIndex = 0;
+      segmentIndex < invalidInitSegments.length;
+      segmentIndex++
+    ) {
+      const parsed = parseInitSegment(invalidInitSegments[segmentIndex]);
+      expect(parsed.video?.editListMediaTime).to.equal(undefined);
+      expect(parsed[1]?.editListMediaTime).to.equal(undefined);
+    }
   });
 
   it('videoOnlyInitSegment removes non-video tracks and patches box sizes', function () {
@@ -422,6 +826,63 @@ function audioInitTrack(id: number): any {
   };
 }
 
+function addVideoEditList(
+  initSegment: Uint8Array<ArrayBuffer>,
+  mediaTime: number,
+  entryCount: number = 1,
+  mediaRateInteger: number = 1,
+  version: 0 | 1 = 0,
+): Uint8Array<ArrayBuffer> {
+  const editListFields: Uint8Array[] = [];
+  editListFields.push(fullBoxHeader(0, version));
+  editListFields.push(uint32(entryCount));
+  switch (version) {
+    case 0:
+      editListFields.push(uint32(0));
+      editListFields.push(uint32(mediaTime));
+      break;
+    case 1:
+      editListFields.push(uint64(0));
+      editListFields.push(uint64(mediaTime));
+      break;
+  }
+  editListFields.push(
+    new Uint8Array([
+      (mediaRateInteger >>> 8) & 0xff,
+      mediaRateInteger & 0xff,
+      0,
+      0,
+    ]),
+  );
+  const editList = MP4.box(
+    0x65647473, // 'edts'
+    MP4.box(0x656c7374, appendBytes(...editListFields)), // 'elst'
+  );
+  const movie = findBox(initSegment, ['moov'])[0];
+  const track = findBox(initSegment, ['moov', 'trak'])[0];
+  const movieBoxOffset = movie.byteOffset - initSegment.byteOffset - 8;
+  const trackBoxOffset = track.byteOffset - initSegment.byteOffset - 8;
+  const insertionOffset = track.byteOffset - initSegment.byteOffset;
+  const result = new Uint8Array(initSegment.byteLength + editList.byteLength);
+  result.set(initSegment.subarray(0, insertionOffset), 0);
+  result.set(editList, insertionOffset);
+  result.set(
+    initSegment.subarray(insertionOffset),
+    insertionOffset + editList.byteLength,
+  );
+  writeUint32(
+    result,
+    movieBoxOffset,
+    readUint32(initSegment, movieBoxOffset) + editList.byteLength,
+  );
+  writeUint32(
+    result,
+    trackBoxOffset,
+    readUint32(initSegment, trackBoxOffset) + editList.byteLength,
+  );
+  return result;
+}
+
 // moof + mdat with three samples (per-sample duration, size, flags and cts)
 // of sizes 10/20/30
 function gopFragment(): Uint8Array<ArrayBuffer> {
@@ -436,10 +897,191 @@ function gopFragment(): Uint8Array<ArrayBuffer> {
   );
 }
 
+function timestampCollisionFragment(
+  firstPresentationTime: number,
+): Uint8Array<ArrayBuffer> {
+  return timingFragment(
+    [firstPresentationTime, 2000, 0, 1000, 3000, 5000],
+    new Array<number>(6).fill(1000),
+  );
+}
+
+function timingFragment(
+  presentationTimes: number[],
+  durations: number[],
+): Uint8Array<ArrayBuffer> {
+  return fragmentFromSamples(timingSamples(presentationTimes, durations));
+}
+
+function timingSamples(
+  presentationTimes: number[],
+  durations: number[],
+  initialDecodeTime: number = 0,
+): TrackFragmentSample[] {
+  expect(presentationTimes).to.have.lengthOf(durations.length);
+  const samples: TrackFragmentSample[] = [];
+  let decodeTime = initialDecodeTime;
+  for (
+    let sampleIndex = 0;
+    sampleIndex < presentationTimes.length;
+    sampleIndex++
+  ) {
+    const duration = durations[sampleIndex];
+    samples.push(
+      gopSample(
+        duration,
+        10,
+        presentationTimes[sampleIndex] - decodeTime,
+        sampleIndex === 0 ? 0 : 1,
+      ),
+    );
+    decodeTime += duration;
+  }
+  return samples;
+}
+
+function fragmentFromSamples(
+  samples: TrackFragmentSample[],
+): Uint8Array<ArrayBuffer> {
+  const mediaDataSize = samples.reduce(
+    (totalSize, sample) => totalSize + sample.size,
+    0,
+  );
+  return appendUint8Array(
+    MP4.moof(0, 0, { type: 'video', id: 1, samples }),
+    MP4.mdat(new Uint8Array(mediaDataSize)),
+  );
+}
+
+function timedTrackFragment(
+  runs: TrackFragmentSample[][],
+): Uint8Array<ArrayBuffer> {
+  return timedFragment([timedTraf(1, runs)]);
+}
+
+function timedFragment(trafs: Uint8Array[]): Uint8Array<ArrayBuffer> {
+  const moofChildren: Uint8Array[] = [];
+  moofChildren.push(
+    MP4.box(types.mfhd, appendBytes(fullBoxHeader(0), uint32(1))),
+  );
+  for (let trafIndex = 0; trafIndex < trafs.length; trafIndex++) {
+    moofChildren.push(trafs[trafIndex]);
+  }
+  const moof = MP4.box(types.moof, ...moofChildren);
+  return appendUint8Array(moof, MP4.mdat(new Uint8Array(1024)));
+}
+
+function timedTraf(trackId: number, runs: TrackFragmentSample[][]): Uint8Array {
+  const trafChildren: Uint8Array[] = [];
+  trafChildren.push(
+    MP4.box(types.tfhd, appendBytes(fullBoxHeader(0x020000), uint32(trackId))),
+  );
+  trafChildren.push(
+    MP4.box(types.tfdt, appendBytes(fullBoxHeader(0), uint32(0))),
+  );
+  for (let runIndex = 0; runIndex < runs.length; runIndex++) {
+    trafChildren.push(timedTrun(runs[runIndex]));
+  }
+  return MP4.box(types.traf, ...trafChildren);
+}
+
+function timedFlagFragment(
+  samples: TrackFragmentSample[],
+  includeSampleFlags: boolean,
+  firstSampleFlags?: number,
+  defaultSampleFlags?: number,
+): Uint8Array<ArrayBuffer> {
+  const trackFragmentHeaderFlags =
+    0x020000 | (defaultSampleFlags === undefined ? 0 : 0x000020);
+  const trackFragmentHeaderFields: Uint8Array[] = [];
+  trackFragmentHeaderFields.push(fullBoxHeader(trackFragmentHeaderFlags));
+  trackFragmentHeaderFields.push(uint32(1));
+  if (defaultSampleFlags !== undefined) {
+    trackFragmentHeaderFields.push(uint32(defaultSampleFlags));
+  }
+  const trackFragment = MP4.box(
+    types.traf,
+    MP4.box(types.tfhd, appendBytes(...trackFragmentHeaderFields)),
+    MP4.box(types.tfdt, appendBytes(fullBoxHeader(0), uint32(0))),
+    timedTrun(samples, includeSampleFlags, firstSampleFlags),
+  );
+  return timedFragment([trackFragment]);
+}
+
+function timedTrun(
+  samples: TrackFragmentSample[],
+  includeSampleFlags: boolean = true,
+  firstSampleFlags?: number,
+): Uint8Array {
+  const trackRunFlags =
+    0x000b01 |
+    (includeSampleFlags ? 0x000400 : 0) |
+    (firstSampleFlags === undefined ? 0 : 0x000004);
+  const trunFields: Uint8Array[] = [];
+  trunFields.push(fullBoxHeader(trackRunFlags, 1));
+  trunFields.push(uint32(samples.length));
+  trunFields.push(uint32(0));
+  if (firstSampleFlags !== undefined) {
+    trunFields.push(uint32(firstSampleFlags));
+  }
+  for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
+    const sample = samples[sampleIndex];
+    trunFields.push(uint32(sample.duration));
+    trunFields.push(uint32(sample.size));
+    if (includeSampleFlags) {
+      trunFields.push(uint32(sampleFlagsFromSample(sample)));
+    }
+    trunFields.push(uint32(sample.cts));
+  }
+  return MP4.box(types.trun, appendBytes(...trunFields));
+}
+
+function sampleFlagsFromSample(sample: TrackFragmentSample): number {
+  return (
+    (sample.flags.isLeading << 26) |
+    (sample.flags.dependsOn << 24) |
+    (sample.flags.isDependedOn << 22) |
+    (sample.flags.hasRedundancy << 20) |
+    (sample.flags.paddingValue << 17) |
+    (sample.flags.isNonSync << 16) |
+    sample.flags.degradPrio
+  );
+}
+
+function sampleFlags(dependsOn: 1 | 2, isNonSync: 0 | 1): number {
+  return (dependsOn << 24) | (isNonSync << 16);
+}
+
+function expectNoTimestampRepair(
+  fragment: Uint8Array<ArrayBuffer>,
+  data: InitData,
+  trackId: number,
+  expectedPresentationTime: number,
+): void {
+  const originalFragment = fragment.slice();
+  const parsedSamples = getSampleData(
+    fragment,
+    data,
+    new ChunkMetadata(0, 0, 0),
+    logger,
+  );
+
+  expect(
+    repairVideoTimestampCollisions(
+      fragment,
+      parsedSamples[trackId],
+      expectedPresentationTime,
+      logger,
+    ),
+  ).to.equal(false);
+  expect(fragment).to.deep.equal(originalFragment);
+}
+
 function gopSample(
   duration: number,
   size: number,
   cts: number,
+  isNonSync: 0 | 1 = 0,
 ): TrackFragmentSample {
   return {
     cts,
@@ -451,7 +1093,7 @@ function gopSample(
       hasRedundancy: 0,
       isDependedOn: 0,
       isLeading: 0,
-      isNonSync: 0,
+      isNonSync,
       paddingValue: 0,
     },
   };
@@ -467,13 +1109,17 @@ function readUint32(buffer: Uint8Array, offset: number): number {
   );
 }
 
-function initData(): InitData {
+function initData(
+  codec: string = 'avc1.42001e',
+  timescale: number = 90000,
+  trackId: number = 1,
+): InitData {
   const data = [] as unknown as InitData;
-  data[1] = {
-    timescale: 90000,
+  data[trackId] = {
+    timescale,
     type: ElementaryStreamTypes.VIDEO,
     stsd: {
-      codec: 'avc1.42001e',
+      codec,
       encrypted: false,
       supplemental: undefined,
     },
@@ -507,9 +1153,9 @@ function fragmentWithTfhdDefaults(
   return appendUint8Array(moof, MP4.mdat(new Uint8Array(mdatSize)));
 }
 
-function fullBoxHeader(flags: number): Uint8Array {
+function fullBoxHeader(flags: number, version: number = 0): Uint8Array {
   return new Uint8Array([
-    0,
+    version,
     (flags >>> 16) & 0xff,
     (flags >>> 8) & 0xff,
     flags & 0xff,

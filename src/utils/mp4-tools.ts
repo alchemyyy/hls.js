@@ -555,6 +555,7 @@ export interface InitDataTrack {
   id: number;
   codec: string;
   encrypted: boolean;
+  editListMediaTime?: number;
   supplemental: string | undefined;
 }
 
@@ -576,6 +577,7 @@ export interface InitData extends Array<any> {
         timescale: number;
         type: HdlrType;
         stsd: StsdData;
+        editListMediaTime?: number;
         default?: {
           duration: number;
           sampleSize: number;
@@ -611,16 +613,28 @@ export function parseInitSegment(initSegment: Uint8Array): InitData {
           // Parse codec details
           const stsdBox = findBox(trak, ['mdia', 'minf', 'stbl', 'stsd'])[0];
           const stsd = parseStsd(stsdBox);
+          const editListMediaTime = parseEditListMediaTime(trak);
           if (type) {
             // Add 'audio', 'video', and 'audiovideo' track records that will map to SourceBuffers
-            result[trackId] = { timescale, type, stsd };
-            result[type] = { timescale, id: trackId, ...stsd };
+            result[trackId] = {
+              timescale,
+              type,
+              stsd,
+              editListMediaTime,
+            };
+            result[type] = {
+              timescale,
+              id: trackId,
+              ...stsd,
+              editListMediaTime,
+            };
           } else {
             // Add 'meta' and other track records
             result[trackId] = {
               timescale,
               type: hdlrType as HdlrType,
               stsd,
+              editListMediaTime,
             };
           }
         }
@@ -642,6 +656,41 @@ export function parseInitSegment(initSegment: Uint8Array): InitData {
   });
 
   return result;
+}
+
+function parseEditListMediaTime(trak: Uint8Array): number | undefined {
+  const editList = findBox(trak, ['edts', 'elst'])[0];
+  if (!editList || editList.length < 20 || readUint32(editList, 4) !== 1) {
+    return;
+  }
+
+  const version = editList[0];
+  let mediaTime: number;
+  let mediaRateOffset: number;
+  switch (version) {
+    case 0:
+      mediaTime = readSint32(editList, 12);
+      mediaRateOffset = 16;
+      break;
+    case 1:
+      if (editList.length < 28 || readSint32(editList, 16) !== 0) {
+        return;
+      }
+      mediaTime = readUint32(editList, 20);
+      mediaRateOffset = 24;
+      break;
+    default:
+      return;
+  }
+
+  if (
+    mediaTime < 0 ||
+    readUint16(editList, mediaRateOffset) !== 1 ||
+    readUint16(editList, mediaRateOffset + 2) !== 0
+  ) {
+    return;
+  }
+  return mediaTime;
 }
 
 function parseStsd(stsd: Uint8Array): StsdData {
@@ -993,6 +1042,9 @@ export function parseSinf(sinf: Uint8Array): BoxDataOrUndefined {
 
 type TrackFragmentRunSample = {
   cts?: number;
+  compositionOffsetFieldOffset?: number;
+  compositionOffsetVersion?: number;
+  dts: number;
   duration: number;
   size: number;
   flags?: {
@@ -1001,6 +1053,7 @@ type TrackFragmentRunSample = {
   };
 };
 type TrackFragmentRun = {
+  firstInTrackFragment: boolean;
   sampleOffset: number;
   samples: TrackFragmentRunSample[];
   lastSampleDurationOffset?: number;
@@ -1018,6 +1071,216 @@ export type TrackTimes = {
   timescale: number;
   type: HdlrType;
 };
+
+/**
+ * Repairs a fragment-opening PTS collision using an external presentation time.
+ */
+export function repairVideoTimestampCollisions(
+  data: Uint8Array,
+  trackTimes: TrackTimes,
+  expectedPresentationTime: number,
+  logger: ILogger,
+): boolean {
+  if (
+    trackTimes.type !== ElementaryStreamTypes.VIDEO ||
+    !Number.isSafeInteger(expectedPresentationTime)
+  ) {
+    return false;
+  }
+
+  const firstRun = trackTimes.trun[0];
+  if (!firstRun?.firstInTrackFragment) {
+    return false;
+  }
+  const samples: TrackFragmentRunSample[] = [];
+  for (let runIndex = 0; runIndex < trackTimes.trun.length; runIndex++) {
+    const fragmentRun = trackTimes.trun[runIndex];
+    if (runIndex > 0 && fragmentRun.firstInTrackFragment) {
+      break;
+    }
+    for (
+      let sampleIndex = 0;
+      sampleIndex < fragmentRun.samples.length;
+      sampleIndex++
+    ) {
+      samples.push(fragmentRun.samples[sampleIndex]);
+    }
+  }
+
+  const firstSample = samples[0];
+  if (
+    samples.length < 3 ||
+    !firstSample.flags ||
+    firstSample.flags.isNonSync ||
+    firstSample.flags.dependsOn === 1 ||
+    firstSample.compositionOffsetFieldOffset === undefined ||
+    firstSample.compositionOffsetVersion === undefined
+  ) {
+    return false;
+  }
+
+  const firstPresentationTime = samplePresentationTime(firstSample);
+  if (
+    firstPresentationTime === expectedPresentationTime ||
+    !isExpectedTimestampRepair(
+      samples,
+      firstPresentationTime,
+      expectedPresentationTime,
+    )
+  ) {
+    return false;
+  }
+
+  const replacementCompositionOffset =
+    expectedPresentationTime - firstSample.dts;
+  const compositionOffsetVersion = firstSample.compositionOffsetVersion;
+  if (
+    (compositionOffsetVersion === 0 &&
+      (replacementCompositionOffset < 0 ||
+        replacementCompositionOffset > UINT32_MAX)) ||
+    (compositionOffsetVersion === 1 &&
+      (replacementCompositionOffset < -2147483648 ||
+        replacementCompositionOffset > 2147483647))
+  ) {
+    return false;
+  }
+
+  writeUint32(
+    data,
+    firstSample.compositionOffsetFieldOffset,
+    replacementCompositionOffset,
+  );
+  firstSample.cts = replacementCompositionOffset;
+  logger.warn(
+    `[mp4-remuxer]: Repaired segment-opening video PTS collision (${firstPresentationTime} -> ${expectedPresentationTime})`,
+  );
+  return true;
+}
+
+function isExpectedTimestampRepair(
+  samples: TrackFragmentRunSample[],
+  firstPresentationTime: number,
+  expectedPresentationTime: number,
+): boolean {
+  const sampleDurations = new Set<number>();
+  const sampleDurationCounts = new Map<number, number>();
+  const remainingSamples: TrackFragmentRunSample[] = [];
+  let expectedTimeIsDecodeTime = false;
+  let hasOpeningCollision = false;
+  for (let sampleIndex = 0; sampleIndex < samples.length; sampleIndex++) {
+    const sample = samples[sampleIndex];
+    if (sample.duration <= 0) {
+      return false;
+    }
+    sampleDurations.add(sample.duration);
+    sampleDurationCounts.set(
+      sample.duration,
+      (sampleDurationCounts.get(sample.duration) || 0) + 1,
+    );
+    if (sample.dts === expectedPresentationTime) {
+      expectedTimeIsDecodeTime = true;
+    }
+    if (sampleIndex === 0) {
+      continue;
+    }
+
+    const presentationTime = samplePresentationTime(sample);
+    if (presentationTime === expectedPresentationTime) {
+      return false;
+    }
+    if (
+      firstPresentationTime < presentationTime + sample.duration &&
+      presentationTime < firstPresentationTime + samples[0].duration
+    ) {
+      hasOpeningCollision = true;
+    }
+    remainingSamples.push(sample);
+  }
+  if (!expectedTimeIsDecodeTime || !hasOpeningCollision) {
+    return false;
+  }
+
+  remainingSamples.sort(
+    (leftSample, rightSample) =>
+      samplePresentationTime(leftSample) - samplePresentationTime(rightSample),
+  );
+  let insertionIndex = 0;
+  while (
+    insertionIndex < remainingSamples.length &&
+    samplePresentationTime(remainingSamples[insertionIndex]) <
+      expectedPresentationTime
+  ) {
+    insertionIndex++;
+  }
+  if (insertionIndex === 0 || insertionIndex === remainingSamples.length) {
+    return false;
+  }
+
+  const previousSample = remainingSamples[insertionIndex - 1];
+  const nextSample = remainingSamples[insertionIndex];
+  const previousPresentationDelta =
+    expectedPresentationTime - samplePresentationTime(previousSample);
+  const nextPresentationDelta =
+    samplePresentationTime(nextSample) - expectedPresentationTime;
+  if (
+    !sampleDurations.has(previousPresentationDelta) ||
+    !sampleDurations.has(nextPresentationDelta)
+  ) {
+    return false;
+  }
+  if (
+    previousSample.duration !== previousPresentationDelta &&
+    ((sampleDurationCounts.get(previousSample.duration) || 0) < 2 ||
+      (sampleDurationCounts.get(previousPresentationDelta) || 0) < 2)
+  ) {
+    return false;
+  }
+
+  const repairedPresentationTimes: number[] = [];
+  for (
+    let sampleIndex = 0;
+    sampleIndex < remainingSamples.length;
+    sampleIndex++
+  ) {
+    repairedPresentationTimes.push(
+      samplePresentationTime(remainingSamples[sampleIndex]),
+    );
+  }
+  repairedPresentationTimes.push(expectedPresentationTime);
+  repairedPresentationTimes.sort(
+    (leftPresentationTime, rightPresentationTime) =>
+      leftPresentationTime - rightPresentationTime,
+  );
+  for (
+    let presentationIndex = 0;
+    presentationIndex + 1 < repairedPresentationTimes.length;
+    presentationIndex++
+  ) {
+    if (
+      !sampleDurations.has(
+        repairedPresentationTimes[presentationIndex + 1] -
+          repairedPresentationTimes[presentationIndex],
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function samplePresentationTime(sample: TrackFragmentRunSample): number {
+  return sample.dts + (sample.cts || 0);
+}
+
+function parseTrackFragmentSampleFlags(sampleFlags: number): {
+  dependsOn: 1 | 2;
+  isNonSync: 0 | 1;
+} {
+  return {
+    dependsOn: ((sampleFlags >>> 24) & 0x03) === 1 ? 1 : 2,
+    isNonSync: ((sampleFlags >>> 16) & 0x01) as 0 | 1,
+  };
+}
 
 export function getSampleData(
   data: Uint8Array,
@@ -1089,6 +1352,7 @@ export function getSampleData(
       let defaultSampleDuration = trackDefault?.duration || 0;
       let defaultSampleDurationOffset: number | undefined;
       let defaultSampleSize = trackDefault?.sampleSize || 0;
+      let defaultSampleFlags = trackDefault?.flags;
       let tfhdOptOffset = 8;
       if (tfhdFlags & 0x000001) {
         // base_data_offset (64-bit)
@@ -1108,6 +1372,11 @@ export function getSampleData(
       if (tfhdFlags & 0x000010) {
         // default_sample_size
         defaultSampleSize = readUint32(tfhd, tfhdOptOffset);
+        tfhdOptOffset += 4;
+      }
+      if (tfhdFlags & 0x000020) {
+        // default_sample_flags
+        defaultSampleFlags = readUint32(tfhd, tfhdOptOffset);
       }
       let baseDataOffset = 0;
       const baseDataOffsetPresent = (tfhdFlags & 0x000001) !== 0;
@@ -1146,16 +1415,15 @@ export function getSampleData(
           dataOffset = readSint32(trun, offset);
           offset += 4;
         }
+        let firstSampleFlags: number | undefined;
         if (firstSampleFlagsPresent) {
-          const isNonSyncSample = trun[offset + 1] & 0x01;
-          if (!isNonSyncSample && trackTimes.keyFrameIndex === undefined) {
-            trackTimes.keyFrameIndex = sampleIndex;
-          }
+          firstSampleFlags = readUint32(trun, offset);
           offset += 4;
         }
         let sampleOffset = baseDataOffset + dataOffset;
         const samples: TrackFragmentRunSample[] = [];
         const fragRun: TrackFragmentRun = {
+          firstInTrackFragment: j === 0,
           sampleOffset,
           samples,
           defaultSampleDurationOffset,
@@ -1180,18 +1448,26 @@ export function getSampleData(
           } else {
             size = defaultSampleSize;
           }
-          let flags;
+          let sampleFlags =
+            ix === 0 && firstSampleFlags !== undefined
+              ? firstSampleFlags
+              : defaultSampleFlags;
           if (sampleFlagsPresent) {
-            const isNonSyncSample = trun[offset + 1] & 0x01;
-            flags = {
-              isNonSync: isNonSyncSample ? 1 : 0,
-              dependsOn: (trun[offset] & 0x03) === 1 ? 1 : 2,
-            };
+            sampleFlags = readUint32(trun, offset);
             offset += 4;
           }
+          const flags =
+            sampleFlags === undefined
+              ? undefined
+              : parseTrackFragmentSampleFlags(sampleFlags);
           let cts = 0;
+          let compositionOffsetFieldOffset: number | undefined;
+          let compositionOffsetVersion: number | undefined;
           if (sampleCompositionTimeOffsetPresent) {
             const version = trun[0];
+            compositionOffsetFieldOffset =
+              trun.byteOffset - data.byteOffset + offset;
+            compositionOffsetVersion = version;
             cts =
               version === 0
                 ? readUint32(trun, offset)
@@ -1209,9 +1485,10 @@ export function getSampleData(
             if (
               flags &&
               !flags.isNonSync &&
+              flags.dependsOn !== 1 &&
               trackTimes.keyFrameIndex === undefined
             ) {
-              trackTimes.keyFrameIndex = ix;
+              trackTimes.keyFrameIndex = sampleIndex + ix;
               trackTimes.keyFrameStart = sampleDTS;
             }
             const pts = sampleDTS + cts;
@@ -1229,6 +1506,9 @@ export function getSampleData(
             }
             samples[ix] = {
               cts,
+              compositionOffsetFieldOffset,
+              compositionOffsetVersion,
+              dts: sampleDTS,
               duration: sampleDuration,
               flags,
               size,

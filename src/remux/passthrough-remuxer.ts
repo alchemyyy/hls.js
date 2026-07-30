@@ -8,6 +8,7 @@ import { type ILogger, Logger } from '../utils/logger';
 import {
   patchEncyptionData,
   remuxVideoOnlyIFrameMoof,
+  repairVideoTimestampCollisions,
   videoOnlyInitSegment,
 } from '../utils/mp4-tools';
 import { getSampleData, parseInitSegment } from '../utils/mp4-tools';
@@ -185,6 +186,7 @@ class PassThroughRemuxer extends Logger implements Remuxer {
     flush: boolean,
     playlistType: PlaylistLevelType,
     chunkMeta: ChunkMetadata,
+    playlistOffset?: number,
   ): RemuxerResult {
     let { initPTS, lastEndTime } = this;
     const result: RemuxerResult = {
@@ -251,7 +253,33 @@ class PassThroughRemuxer extends Logger implements Remuxer {
       this.emitInitSegment = false;
     }
 
-    const trackSampleData = getSampleData(data, initData, chunkMeta, this);
+    let trackSampleData = getSampleData(data, initData, chunkMeta, this);
+    const initialVideoSampleTimestamps = initData.video
+      ? trackSampleData[initData.video.id]
+      : null;
+    const videoEditListMediaTime = initData.video?.editListMediaTime;
+    const expectedVideoPresentationTime =
+      accurateTimeOffset &&
+      !chunkMeta.iframe &&
+      !chunkMeta.partial &&
+      initData.video &&
+      playlistOffset !== undefined &&
+      videoEditListMediaTime !== undefined
+        ? Math.round(playlistOffset * initData.video.timescale) +
+          videoEditListMediaTime
+        : undefined;
+    if (
+      initialVideoSampleTimestamps &&
+      expectedVideoPresentationTime !== undefined &&
+      repairVideoTimestampCollisions(
+        data,
+        initialVideoSampleTimestamps,
+        expectedVideoPresentationTime,
+        this,
+      )
+    ) {
+      trackSampleData = getSampleData(data, initData, chunkMeta, this);
+    }
     const audioSampleTimestamps = initData.audio
       ? trackSampleData[initData.audio.id]
       : null;

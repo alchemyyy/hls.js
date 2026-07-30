@@ -104,6 +104,100 @@ describe('passthrough-remuxer', function () {
     );
   }
 
+  function remuxTimestampCollision(
+    editListMediaTime: number | undefined,
+    accurateTimeOffset: boolean,
+    iframe: boolean,
+    playlistOffset: number | undefined,
+    partial: boolean = false,
+  ): Uint8Array<ArrayBuffer> {
+    let initSegment = MP4.initSegment([videoInitTrack()]);
+    if (editListMediaTime !== undefined) {
+      initSegment = addVideoEditList(initSegment, editListMediaTime);
+    }
+    remuxer.resetInitSegment(initSegment, undefined, 'avc1.42001e', null);
+    const fragmentData = mp4Fragment([
+      sample(1000, 4, 1984),
+      sample(1000, 4, 1000),
+      sample(1000, 4, -2000),
+      sample(1000, 4, -2000),
+      sample(1000, 4, -1000),
+      sample(1000, 4, 0),
+    ]);
+
+    const result = remuxer.remux(
+      audioTrack(),
+      passthroughTrack(fragmentData),
+      metadataTrack(),
+      userdataTrack(),
+      1 / 25,
+      accurateTimeOffset,
+      true,
+      PlaylistLevelType.MAIN,
+      new ChunkMetadata(
+        0,
+        1,
+        0,
+        fragmentData.byteLength,
+        partial ? 0 : -1,
+        partial,
+        6 / 90,
+        iframe,
+      ),
+      playlistOffset,
+    );
+
+    expect(result.video, 'video track').to.exist;
+    return result.video!.data1;
+  }
+
+  it('uses the original playlist offset and video edit list to repair an opening PTS collision', function () {
+    const fragmentData = remuxTimestampCollision(1000, true, false, 1 / 30);
+    const trun = findBox(fragmentData, ['moof', 'traf', 'trun'])[0];
+    expect(readUint32(trun, 24), 'opening composition offset').to.equal(4000);
+  });
+
+  it('does not repair a PTS collision without an accurate playlist time', function () {
+    const fragmentData = remuxTimestampCollision(1000, false, false, 1 / 30);
+    const trun = findBox(fragmentData, ['moof', 'traf', 'trun'])[0];
+    expect(readUint32(trun, 24), 'opening composition offset').to.equal(1984);
+  });
+
+  it('does not repair a PTS collision without a supported edit list', function () {
+    const fragmentData = remuxTimestampCollision(
+      undefined,
+      true,
+      false,
+      1 / 30,
+    );
+    const trun = findBox(fragmentData, ['moof', 'traf', 'trun'])[0];
+    expect(readUint32(trun, 24), 'opening composition offset').to.equal(1984);
+  });
+
+  it('does not repair a PTS collision without an original playlist offset', function () {
+    const fragmentData = remuxTimestampCollision(1000, true, false, undefined);
+    const trun = findBox(fragmentData, ['moof', 'traf', 'trun'])[0];
+    expect(readUint32(trun, 24), 'opening composition offset').to.equal(1984);
+  });
+
+  it('does not repair PTS collisions in I-Frame playlist fragments', function () {
+    const fragmentData = remuxTimestampCollision(1000, true, true, 1 / 30);
+    const trun = findBox(fragmentData, ['moof', 'traf', 'trun'])[0];
+    expect(readUint32(trun, 24), 'opening composition offset').to.equal(1984);
+  });
+
+  it('does not repair PTS collisions in partial fragments', function () {
+    const fragmentData = remuxTimestampCollision(
+      1000,
+      true,
+      false,
+      1 / 30,
+      true,
+    );
+    const trun = findBox(fragmentData, ['moof', 'traf', 'trun'])[0];
+    expect(readUint32(trun, 24), 'opening composition offset').to.equal(1984);
+  });
+
   it('remuxes moof+mdat to stretch a single-keyframe iframe to the EXTINF duration', function () {
     const extinfDuration = 4;
     const fragmentData = mp4Fragment([sample(3003, 4, 0)]);
@@ -426,6 +520,43 @@ function markVideoInitSegmentEncrypted(
   const sampleEntry = findBox(stsd.subarray(8), ['avc1'])[0];
   const typeOffset = sampleEntry.byteOffset - initSegment.byteOffset - 4;
   initSegment.set([0x65, 0x6e, 0x63, 0x76], typeOffset); // 'encv'
+}
+
+function addVideoEditList(
+  initSegment: Uint8Array<ArrayBuffer>,
+  mediaTime: number,
+): Uint8Array<ArrayBuffer> {
+  const editListPayload = new Uint8Array(20);
+  writeUint32(editListPayload, 4, 1);
+  writeUint32(editListPayload, 12, mediaTime);
+  editListPayload.set([0, 1, 0, 0], 16);
+  const editList = MP4.box(
+    0x65647473, // 'edts'
+    MP4.box(0x656c7374, editListPayload), // 'elst'
+  );
+  const movie = findBox(initSegment, ['moov'])[0];
+  const track = findBox(initSegment, ['moov', 'trak'])[0];
+  const movieBoxOffset = movie.byteOffset - initSegment.byteOffset - 8;
+  const trackBoxOffset = track.byteOffset - initSegment.byteOffset - 8;
+  const insertionOffset = track.byteOffset - initSegment.byteOffset;
+  const result = new Uint8Array(initSegment.byteLength + editList.byteLength);
+  result.set(initSegment.subarray(0, insertionOffset), 0);
+  result.set(editList, insertionOffset);
+  result.set(
+    initSegment.subarray(insertionOffset),
+    insertionOffset + editList.byteLength,
+  );
+  writeUint32(
+    result,
+    movieBoxOffset,
+    readUint32(initSegment, movieBoxOffset) + editList.byteLength,
+  );
+  writeUint32(
+    result,
+    trackBoxOffset,
+    readUint32(initSegment, trackBoxOffset) + editList.byteLength,
+  );
+  return result;
 }
 
 function readUint32(buffer: Uint8Array, offset: number): number {

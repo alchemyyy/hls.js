@@ -9,7 +9,10 @@ import { changeTypeSupported } from '../is-supported';
 import { ElementaryStreamTypes, isMediaFragment } from '../loader/fragment';
 import { getAESAdjustments } from '../loader/fragment-loader';
 import { LoaderContextType, PlaylistLevelType } from '../types/loader';
-import { ChunkMetadata } from '../types/transmuxer';
+import {
+  ChunkMetadata,
+  setChunkMetadataPlaylistOffset,
+} from '../types/transmuxer';
 import { BufferHelper } from '../utils/buffer-helper';
 import { pickMostCompleteCodecName } from '../utils/codecs';
 import {
@@ -832,6 +835,9 @@ export default class StreamController
       this.iframesOnly,
       decryptRange,
     );
+    if (!details.live && frag.cc === 0) {
+      setChunkMetadataPlaylistOffset(chunkMeta, frag.playlistOffset);
+    }
     const initPTS = this.initPTS[frag.cc];
 
     transmuxer.push(

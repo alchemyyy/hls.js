@@ -6,7 +6,10 @@ import TransmuxerInterface from '../../../src/demux/transmuxer-interface';
 import Hls from '../../../src/hls';
 import { Fragment } from '../../../src/loader/fragment';
 import { PlaylistLevelType } from '../../../src/types/loader';
-import { ChunkMetadata } from '../../../src/types/transmuxer';
+import {
+  ChunkMetadata,
+  setChunkMetadataPlaylistOffset,
+} from '../../../src/types/transmuxer';
 import type { MediaFragment } from '../../../src/loader/fragment';
 import type { TransmuxerResult } from '../../../src/types/transmuxer';
 
@@ -130,8 +133,18 @@ describe('TransmuxerInterface tests', function () {
     const videoCodec = '';
     const duration = 0;
     const accurateTimeOffset = true;
+    const firstPlaylistOffset = 12.5;
     let chunkMeta = new ChunkMetadata(currentFrag.level, currentFrag.sn + 1, 0);
-    let state = new TransmuxState(false, true, true, false, 0, false);
+    let state = new TransmuxState(
+      false,
+      true,
+      true,
+      false,
+      0,
+      false,
+      firstPlaylistOffset,
+    );
+    setChunkMetadataPlaylistOffset(chunkMeta, firstPlaylistOffset);
     transmuxerInterface.push(
       data,
       initSegmentData,
@@ -163,8 +176,18 @@ describe('TransmuxerInterface tests', function () {
     newFrag.level = 1;
     newFrag.start = 1000;
     newFrag.startPTS = 1000;
+    const secondPlaylistOffset = 18.5;
     chunkMeta = new ChunkMetadata(newFrag.level, newFrag.sn, 0);
-    state = new TransmuxState(false, true, true, false, 1000, false);
+    state = new TransmuxState(
+      false,
+      true,
+      true,
+      false,
+      1000,
+      false,
+      secondPlaylistOffset,
+    );
+    setChunkMetadataPlaylistOffset(chunkMeta, secondPlaylistOffset);
     transmuxerInterface.push(
       data,
       initSegmentData,
@@ -224,7 +247,9 @@ describe('TransmuxerInterface tests', function () {
     const videoCodec = '';
     const duration = 0;
     const accurateTimeOffset = true;
+    const playlistOffset = 12.5;
     const chunkMeta = new ChunkMetadata(newFrag.level, newFrag.sn, 0);
+    setChunkMetadataPlaylistOffset(chunkMeta, playlistOffset);
 
     const configureStub = sinon.stub(
       transmuxerInterfacePrivates.transmuxer,
@@ -245,7 +270,15 @@ describe('TransmuxerInterface tests', function () {
     );
 
     const tConfig = new TransmuxConfig('', '', initSegmentData, 0);
-    const state = new TransmuxState(true, false, true, true, 1000, false);
+    const state = new TransmuxState(
+      true,
+      false,
+      true,
+      true,
+      1000,
+      false,
+      playlistOffset,
+    );
     expect(configureStub).to.have.been.calledOnce;
     expect(configureStub).to.have.been.calledWith(tConfig);
 
