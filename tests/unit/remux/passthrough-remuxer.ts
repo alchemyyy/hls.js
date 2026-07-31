@@ -13,6 +13,10 @@ import {
   types,
   writeUint32,
 } from '../../../src/utils/mp4-tools';
+import {
+  type FMP4OpeningPTSCollisionFixture,
+  loadFMP4OpeningPTSCollisionFixture,
+} from '../fixtures/fmp4-opening-pts-collision';
 import type { HlsEventEmitter } from '../../../src/events';
 import type { TrackFragmentSample } from '../../../src/remux/mp4-generator';
 import type {
@@ -150,6 +154,61 @@ describe('passthrough-remuxer', function () {
     expect(result.video, 'video track').to.exist;
     return result.video!.data1;
   }
+
+  it('repairs a captured FFmpeg fragment-opening PTS collision', function () {
+    return loadFMP4OpeningPTSCollisionFixture().then(
+      (fixture: FMP4OpeningPTSCollisionFixture): void => {
+        remuxer.resetInitSegment(
+          fixture.initializationSegment,
+          'fLaC',
+          'avc1.640029',
+          null,
+        );
+        const initialTrackRun = findBox(fixture.mediaSegment, [
+          'moof',
+          'traf',
+          'trun',
+        ])[0];
+        expect(
+          readUint32(initialTrackRun, 24),
+          'captured opening composition offset',
+        ).to.equal(2672);
+
+        const result = remuxer.remux(
+          audioTrack(),
+          passthroughTrack(fixture.mediaSegment),
+          metadataTrack(),
+          userdataTrack(),
+          fixture.playlistOffset,
+          true,
+          true,
+          PlaylistLevelType.MAIN,
+          new ChunkMetadata(
+            0,
+            3,
+            0,
+            fixture.mediaSegment.byteLength,
+            -1,
+            false,
+            fixture.segmentDuration,
+            false,
+          ),
+          fixture.playlistOffset,
+        );
+
+        expect(result.video, 'video track').to.exist;
+        const repairedTrackRun = findBox(result.video!.data1, [
+          'moof',
+          'traf',
+          'trun',
+        ])[0];
+        expect(
+          readUint32(repairedTrackRun, 24),
+          'repaired opening composition offset',
+        ).to.equal(4016);
+      },
+    );
+  });
 
   it('uses the original playlist offset and video edit list to repair an opening PTS collision', function () {
     const fragmentData = remuxTimestampCollision(1000, true, false, 1 / 30);

@@ -43,6 +43,12 @@ module.exports = function (config) {
     // list of files / patterns to load in the browser
     files: [
       {
+        pattern: 'tests/unit/fixtures/**/*.mp4',
+        included: false,
+        served: true,
+        watched: false,
+      },
+      {
         pattern: 'tests/index.js',
         watched: false,
       },
