@@ -228,6 +228,8 @@ class FetchLoader extends BaseLoader {
   ): Promise<ArrayBuffer> {
     const chunkCache = new ChunkCache();
     const reader = (response.body as ReadableStream).getReader();
+    const maximumChunkSize =
+      highWaterMark > 0 ? Math.max(1, Math.floor(highWaterMark)) : 0;
 
     const pump = (): Promise<ArrayBuffer> => {
       return reader
@@ -243,18 +245,20 @@ class FetchLoader extends BaseLoader {
           const chunk: Uint8Array<ArrayBuffer> = data.value;
           const len = chunk.length;
           stats.loaded += len;
-          if (len < highWaterMark || chunkCache.dataLength) {
-            // The current chunk is too small to to be emitted or the cache already has data
-            // Push it to the cache
-            chunkCache.push(chunk);
-            if (chunkCache.dataLength >= highWaterMark) {
-              // flush in order to join the typed arrays
-              onProgress(stats, context, chunkCache.flush().buffer, response);
-            }
-          } else {
-            // If there's nothing cached already, and the chache is large enough
-            // just emit the progress event
-            onProgress(stats, context, chunk.buffer, response);
+          chunkCache.push(chunk);
+          if (maximumChunkSize === 0) {
+            onProgress(stats, context, chunkCache.flush().buffer, response);
+            return pump();
+          }
+          // ReadableStream chunks can exceed highWaterMark, so drain bounded
+          // progress payloads instead of forwarding a large browser chunk
+          while (chunkCache.dataLength >= maximumChunkSize) {
+            onProgress(
+              stats,
+              context,
+              chunkCache.flush(maximumChunkSize).buffer,
+              response,
+            );
           }
           return pump();
         })

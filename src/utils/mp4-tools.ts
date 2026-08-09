@@ -13,6 +13,9 @@ type BoxDataOrUndefined = Uint8Array<ArrayBuffer> | undefined;
 
 export const UINT32_MAX = Math.pow(2, 32) - 1;
 
+const MP4_BOX_HEADER_SIZE = 8;
+const MP4_EXTENDED_BOX_HEADER_SIZE = 16;
+
 export const types = {
   avc1: 0x61766331,
   avcC: 0x61766343,
@@ -88,7 +91,7 @@ function readUint32(buffer: Uint8Array, offset: number): number {
   return val < 0 ? 4294967296 + val : val;
 }
 
-function readUint64(buffer: Uint8Array, offset: number) {
+function readUint64(buffer: Uint8Array, offset: number): number {
   let result = readUint32(buffer, offset);
   result *= Math.pow(2, 32);
   result += readUint32(buffer, offset + 4);
@@ -1067,8 +1070,15 @@ export type ParsedSampleData = {
   tracks: Record<number, TrackTimes>;
 };
 
+export type ProgressiveVideoSample = {
+  end: number;
+  pts: number;
+  start: number;
+};
+
 type SeiSampleContext = {
   isHEVCFlavor: boolean;
+  progressiveSamples?: ProgressiveVideoSample[];
   samples: UserdataSample[];
   timeOffset: number;
   timescale: number;
@@ -1197,20 +1207,26 @@ export function parseSamplesAndTiming(
   initData: InitData,
   logger: ILogger,
   includeSampleDetails = false,
+  includeProgressiveSamples = false,
 ): {
+  progressiveSamples: ProgressiveVideoSample[] | undefined;
   samples: UserdataSample[];
   sampleData: ParsedSampleData;
 } {
   const samples: UserdataSample[] = [];
+  const progressiveSamples: ProgressiveVideoSample[] | undefined =
+    includeProgressiveSamples ? [] : undefined;
   const data = track.samples;
   const tracks = parseSampleData(data, initData, logger, includeSampleDetails, {
     isHEVCFlavor: isHEVC(track.codec),
+    progressiveSamples,
     samples,
     timeOffset,
     timescale: track.timescale,
     trackId: track.id,
   });
   return {
+    progressiveSamples,
     samples,
     sampleData: {
       includeSampleDetails,
@@ -1370,7 +1386,6 @@ function parseSampleData(
         const seiSampleDuration =
           defaultSampleDuration / (seiContext?.timescale ?? 1);
         const hevcSei = seiContext?.isHEVCFlavor === true;
-        const seiHeaderSize = hevcSei ? 2 : 1;
 
         for (let ix = 0; ix < sampleCount; ix++) {
           const size =
@@ -1387,33 +1402,20 @@ function parseSampleData(
           const sampleEnd = sampleOffset + size;
 
           if (scanSei) {
-            if (size > 0) {
-              let naluOffset = sampleOffset;
-              do {
-                const naluSize =
-                  data[naluOffset] === 0
-                    ? (data[naluOffset + 1] << 16) |
-                      (data[naluOffset + 2] << 8) |
-                      data[naluOffset + 3]
-                    : readUint32(data, naluOffset);
-                naluOffset += 4;
-                const naluHeader = data[naluOffset];
-                const naluType = hevcSei
-                  ? (naluHeader >> 1) & 0x3f
-                  : naluHeader & 0x1f;
-                const isSei = hevcSei
-                  ? naluType === 39 || naluType === 40
-                  : naluType === 6;
-                if (isSei) {
-                  parseSEIMessageFromNALu(
-                    data.subarray(naluOffset, naluOffset + naluSize),
-                    seiHeaderSize,
-                    seiTimeOffset,
-                    seiContext.samples,
-                  );
-                }
-                naluOffset += naluSize;
-              } while (naluOffset < sampleEnd);
+            seiContext.progressiveSamples?.push({
+              end: sampleEnd,
+              pts: seiTimeOffset,
+              start: sampleOffset,
+            });
+            if (size > 0 && sampleEnd <= eof) {
+              parseSEIFromSample(
+                data,
+                sampleOffset,
+                sampleEnd,
+                hevcSei,
+                seiTimeOffset,
+                seiContext.samples,
+              );
             }
             seiTimeOffset += seiSampleDuration;
           }
@@ -1529,26 +1531,28 @@ function parseSampleData(
             version === 0 ? readUint32(trun, offset) : readSint32(trun, offset);
           offset += 4;
         }
+        const sampleEnd = sampleOffset + size;
         if (scanSei) {
-          let naluOffset = sampleOffset;
-          let naluTotalSize = 0;
-          while (naluTotalSize < size) {
-            const naluSize = readUint32(data, naluOffset);
-            naluOffset += 4;
-            if (isSEIMessage(seiContext.isHEVCFlavor, data[naluOffset])) {
-              parseSEIMessageFromNALu(
-                data.subarray(naluOffset, naluOffset + naluSize),
-                seiContext.isHEVCFlavor ? 2 : 1,
-                seiContext.timeOffset + cts / seiContext.timescale,
-                seiContext.samples,
-              );
-            }
-            naluOffset += naluSize;
-            naluTotalSize += naluSize + 4;
-          }
+          seiContext.progressiveSamples?.push({
+            end: sampleEnd,
+            pts: seiContext.timeOffset + cts / seiContext.timescale,
+            start: sampleOffset,
+          });
+        }
+        if (scanSei && sampleEnd <= eof) {
+          parseSEIFromSample(
+            data,
+            sampleOffset,
+            sampleEnd,
+            seiContext.isHEVCFlavor,
+            seiContext.timeOffset + cts / seiContext.timescale,
+            seiContext.samples,
+          );
+        }
+        if (scanSei) {
           seiContext.timeOffset += sampleDuration / seiContext.timescale;
         }
-        sampleOffset += size;
+        sampleOffset = sampleEnd;
         // Capture only fitting samples so a partial-mdat truncation
         // can still rewrite the right uint32 to balance EXTINF. Field
         // offsets above advance for every declared sample to stay aligned.
@@ -1625,28 +1629,110 @@ function parseSampleData(
   return tracks;
 }
 
-// TODO: Check if the last moof+mdat pair is part of the valid range
+/**
+ * Return the next independently parseable fMP4 range. Progressive callers can
+ * emit through the received portion of mdat once its moof and header are whole.
+ */
 export function segmentValidRange(
   data: Uint8Array<ArrayBuffer>,
+  allowIncompleteMdat: boolean = false,
 ): SegmentedRange {
   const segmentedRange: SegmentedRange = {
+    mdatEnd: null,
     valid: null,
     remainder: null,
   };
 
-  const moofs = findBox(data, ['moof']);
-  if (moofs.length < 2) {
-    segmentedRange.remainder = data;
+  const endOffset = data.byteLength;
+  let offset = 0;
+  let completePairEnd = 0;
+  let hasCompleteMoof = false;
+
+  while (offset < endOffset) {
+    const boxHeader = readBoxHeader(data, offset);
+    if (!boxHeader) {
+      break;
+    }
+
+    const { size, type } = boxHeader;
+    if (type === types.mdat && hasCompleteMoof) {
+      if (allowIncompleteMdat) {
+        const mdatEnd = Number.isFinite(size) ? offset + size : Infinity;
+        const validEnd = Math.min(endOffset, mdatEnd);
+        segmentedRange.mdatEnd = mdatEnd;
+        segmentedRange.valid = data.slice(0, validEnd);
+        if (validEnd < endOffset) {
+          segmentedRange.remainder = data.slice(validEnd);
+        }
+        return segmentedRange;
+      }
+      if (!Number.isFinite(size) || offset + size > endOffset) {
+        break;
+      }
+      completePairEnd = offset + size;
+      segmentedRange.mdatEnd = completePairEnd;
+      hasCompleteMoof = false;
+      offset = completePairEnd;
+      continue;
+    }
+
+    if (!Number.isFinite(size) || offset + size > endOffset) {
+      break;
+    }
+    if (type === types.moof) {
+      hasCompleteMoof = true;
+    }
+    offset += size;
+  }
+
+  if (completePairEnd > 0) {
+    segmentedRange.valid = data.slice(0, completePairEnd);
+    if (completePairEnd < endOffset) {
+      segmentedRange.remainder = data.slice(completePairEnd);
+    }
     return segmentedRange;
   }
-  const last = moofs[moofs.length - 1];
-  // Offset by 8 bytes; findBox offsets the start by as much
-  segmentedRange.valid = data.slice(0, last.byteOffset - 8);
-  segmentedRange.remainder = data.slice(last.byteOffset - 8);
+
+  segmentedRange.remainder = data;
   return segmentedRange;
 }
 
+type BoxHeader = {
+  size: number;
+  type: number;
+};
+
+function readBoxHeader(data: Uint8Array, offset: number): BoxHeader | null {
+  if (offset + MP4_BOX_HEADER_SIZE > data.byteLength) {
+    return null;
+  }
+
+  const size = readUint32(data, offset);
+  const type = readUint32(data, offset + 4);
+  if (size === 0) {
+    return { size: Infinity, type };
+  }
+  if (size === 1) {
+    if (offset + MP4_EXTENDED_BOX_HEADER_SIZE > data.byteLength) {
+      return null;
+    }
+    const extendedSize = readUint64(data, offset + MP4_BOX_HEADER_SIZE);
+    if (
+      !Number.isSafeInteger(extendedSize) ||
+      extendedSize < MP4_EXTENDED_BOX_HEADER_SIZE
+    ) {
+      return null;
+    }
+    return { size: extendedSize, type };
+  }
+  if (size < MP4_BOX_HEADER_SIZE) {
+    return null;
+  }
+  return { size, type };
+}
+
 export interface SegmentedRange {
+  mdatEnd: number | null;
   valid: Uint8Array<ArrayBuffer> | null;
   remainder: Uint8Array<ArrayBuffer> | null;
 }
@@ -1834,6 +1920,34 @@ export function isHEVC(codec: string | undefined) {
     baseCodec === 'dvh1' ||
     baseCodec === 'dvhe'
   );
+}
+
+export function parseSEIFromSample(
+  data: Uint8Array,
+  sampleStart: number,
+  sampleEnd: number,
+  isHEVCFlavor: boolean,
+  pts: number,
+  samples: UserdataSample[],
+): void {
+  let naluOffset = sampleStart;
+  while (naluOffset + 4 <= sampleEnd) {
+    const naluSize = readUint32(data, naluOffset);
+    naluOffset += 4;
+    const naluEnd = naluOffset + naluSize;
+    if (naluSize === 0 || naluEnd > sampleEnd) {
+      return;
+    }
+    if (isSEIMessage(isHEVCFlavor, data[naluOffset])) {
+      parseSEIMessageFromNALu(
+        data.subarray(naluOffset, naluEnd),
+        isHEVCFlavor ? 2 : 1,
+        pts,
+        samples,
+      );
+    }
+    naluOffset = naluEnd;
+  }
 }
 
 function isSEIMessage(isHEVCFlavor: boolean, naluHeader: number) {

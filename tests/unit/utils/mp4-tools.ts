@@ -13,6 +13,7 @@ import {
   parseInitSegment,
   parseSEIMessageFromNALu,
   remuxVideoOnlyIFrameMoof,
+  segmentValidRange,
   types,
   videoOnlyInitSegment,
 } from '../../../src/utils/mp4-tools';
@@ -57,6 +58,65 @@ describe('mp4-tools', function () {
     expect(discardEPB(escaped)).to.deep.equal(
       new Uint8Array([0x06, 0x00, 0x00, 0x01, 0x00, 0x00, 0x02]),
     );
+  });
+
+  describe('segmentValidRange', function () {
+    it('emits a partial mdat after receiving a complete moof and mdat header', function () {
+      const moof = MP4.box(types.moof, new Uint8Array(16));
+      const mdat = MP4.mdat(new Uint8Array(64));
+      const partialSegment = appendBytes(moof, mdat.subarray(0, 24));
+
+      const segmented = segmentValidRange(partialSegment, true);
+
+      expect(segmented.valid).to.deep.equal(partialSegment);
+      expect(segmented.remainder).to.equal(null);
+    });
+
+    it('retains a partial mdat when partial emission is disabled', function () {
+      const moof = MP4.box(types.moof, new Uint8Array(16));
+      const mdat = MP4.mdat(new Uint8Array(64));
+      const partialSegment = appendBytes(moof, mdat.subarray(0, 24));
+
+      const segmented = segmentValidRange(partialSegment);
+
+      expect(segmented.valid).to.equal(null);
+      expect(segmented.remainder).to.equal(partialSegment);
+    });
+
+    it('emits complete pairs and retains a trailing incomplete moof', function () {
+      const firstPair = appendBytes(
+        MP4.box(types.moof, new Uint8Array(16)),
+        MP4.mdat(new Uint8Array(32)),
+      );
+      const trailingMoof = MP4.box(types.moof, new Uint8Array(24));
+      const partialTrailingMoof = trailingMoof.subarray(0, 12);
+      const data = appendBytes(firstPair, partialTrailingMoof);
+
+      const segmented = segmentValidRange(data);
+
+      expect(segmented.valid).to.deep.equal(firstPair);
+      expect(segmented.remainder).to.deep.equal(partialTrailingMoof);
+    });
+
+    it('does not include the next pair in a partial mdat range', function () {
+      const firstPair = appendBytes(
+        MP4.box(types.moof, new Uint8Array(16)),
+        MP4.mdat(new Uint8Array(16)),
+      );
+      const secondPair = appendBytes(
+        MP4.box(types.moof, new Uint8Array(16)),
+        MP4.mdat(new Uint8Array(16)),
+      );
+
+      const segmented = segmentValidRange(
+        appendBytes(firstPair, secondPair),
+        true,
+      );
+
+      expect(segmented.valid).to.deep.equal(firstPair);
+      expect(segmented.remainder).to.deep.equal(secondPair);
+      expect(segmented.mdatEnd).to.equal(firstPair.byteLength);
+    });
   });
 
   it('reads tfhd default sample duration and size in declaration order', function () {

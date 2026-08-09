@@ -104,6 +104,18 @@ describe('BufferOperationQueue tests', function () {
     });
   });
 
+  describe('clear', function () {
+    it('clears only the selected queue', function () {
+      operationQueue.queues.audio.push({});
+      operationQueue.queues.video.push({});
+
+      operationQueue.clear('video');
+
+      expect(operationQueue.queues.video).to.have.length(0);
+      expect(operationQueue.queues.audio).to.have.length(1);
+    });
+  });
+
   describe('executeNext', function () {
     it('does nothing if executing against an empty queue', function () {
       queueNames.forEach((name) => {

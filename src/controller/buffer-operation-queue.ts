@@ -89,6 +89,13 @@ export default class BufferOperationQueue {
     this.queues[type].splice(1, 0, ...operations);
   }
 
+  public clear(type: SourceBufferName): void {
+    if (this.queues === null) {
+      return;
+    }
+    this.queues[type].length = 0;
+  }
+
   public unblockAudio() {
     if (this.queues === null) {
       return;

@@ -74,7 +74,7 @@ export interface LoaderConfiguration {
    */
   // max connection retry delay (ms)
   maxRetryDelay: number;
-  // When streaming progressively, this is the minimum chunk size required to emit a PROGRESS event
+  // Positive values cap PROGRESS event payloads when streaming progressively
   highWaterMark?: number;
 }
 

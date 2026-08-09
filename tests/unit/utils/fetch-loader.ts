@@ -66,6 +66,35 @@ describe('FetchLoader', function () {
     sandbox.restore();
   });
 
+  it('bounds progressive events to the configured chunk size', function (done) {
+    const responseData = new Uint8Array([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    const progressChunks: number[][] = [];
+    context.responseType = 'arraybuffer';
+    config.highWaterMark = 4;
+    sandbox.stub(self, 'fetch').resolves(new Response(responseData));
+    callbacks.onProgress = sandbox
+      .stub()
+      .callsFake(
+        (_stats: unknown, _context: LoaderContext, data: ArrayBuffer) => {
+          progressChunks.push(Array.from(new Uint8Array(data)));
+        },
+      );
+    callbacks.onSuccess = sandbox.stub().callsFake(() => {
+      try {
+        expect(progressChunks).to.deep.equal([
+          [0, 1, 2, 3],
+          [4, 5, 6, 7],
+          [8, 9],
+        ]);
+        done();
+      } catch (error) {
+        done(error);
+      }
+    });
+
+    fetchLoader.load(context, config, callbacks);
+  });
+
   describe('retry on HTTP error', function () {
     it('should retry on 503 Service Unavailable', function (done) {
       let attemptCount = 0;

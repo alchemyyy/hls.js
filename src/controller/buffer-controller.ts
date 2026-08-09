@@ -625,6 +625,7 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
     if (this.operationQueue) {
       this.operationQueue.destroy();
     }
+    this._quotaEvictionPending = {};
     this.operationQueue = new BufferOperationQueue(this.tracks);
   }
 
@@ -1067,6 +1068,9 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
             event.details = ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET;
           }
         }
+        if (this.hls.config.progressive && sn !== 'initSegment') {
+          this.resetProgressiveAppend(type);
+        }
         this.appendError = event;
         this.hls.trigger(Events.ERROR, event);
         if (isQuotaError && this.hls) {
@@ -1080,6 +1084,20 @@ transfer tracks: ${stringify(transferredTracks, (key, value) => (key === 'initSe
       } playlist ${frag.level} cc: ${cc} offset: ${offset} bytes: ${data.byteLength}`,
     );
     this.append(operation, type, this.isPending(this.tracks[type]));
+  }
+
+  private resetProgressiveAppend(type: SourceBufferName): void {
+    // Later chunks cannot follow a failed partial mdat append
+    this.operationQueue?.clear(type);
+    this._quotaEvictionPending[type] = false;
+    const sourceBuffer = this.tracks[type]?.buffer;
+    if (sourceBuffer && this.mediaSource?.readyState === 'open') {
+      try {
+        sourceBuffer.abort();
+      } catch (error) {
+        this.warn(`Failed to reset the ${type} SourceBuffer parser`, error);
+      }
+    }
   }
 
   private getClearEvictionPendingOp(type: SourceBufferName): BufferOperation {

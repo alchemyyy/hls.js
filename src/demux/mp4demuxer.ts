@@ -17,10 +17,12 @@ import {
   appendUint8Array,
   findBox,
   hasBoxData,
+  isHEVC,
   parseEmsg,
   parseInitSegment,
   parseSamples,
   parseSamplesAndTiming,
+  parseSEIFromSample,
   RemuxerTrackIdConfig,
   segmentValidRange,
 } from '../utils/mp4-tools';
@@ -32,12 +34,25 @@ import type {
   IEmsgParsingData,
   InitData,
   ParsedSampleData,
+  ProgressiveVideoSample,
 } from '../utils/mp4-tools';
 
 const emsgSchemePattern = /\/emsg[-/]ID3/i;
 
 class MP4Demuxer implements Demuxer {
   private remainderData: Uint8Array<ArrayBuffer> | null = null;
+  // Partial mdat state lets MSE consume bounded network chunks without
+  // buffering the complete media segment in the transmuxer
+  private progressiveMdatPending: boolean = false;
+  private progressiveMdatEnd: number = 0;
+  private progressiveSampleData?: ParsedSampleData;
+  private progressiveSamples: ProgressiveVideoSample[] = [];
+  private progressiveSampleIndex: number = 0;
+  private progressiveSampleParts: Uint8Array<ArrayBuffer>[] = [];
+  private progressiveSamplePartsLength: number = 0;
+  private progressiveSampleSkipped: boolean = false;
+  private progressiveOffset: number = 0;
+  private progressiveIsHEVC: boolean = false;
   private timeOffset: number = 0;
   private config: HlsConfig;
   private videoTrack?: PassthroughTrack;
@@ -65,6 +80,7 @@ class MP4Demuxer implements Demuxer {
     videoCodec: string | undefined,
     trackDuration: number,
   ) {
+    this.resetProgressiveState();
     const videoTrack = (this.videoTrack = dummyTrack(
       'video',
       1,
@@ -108,7 +124,7 @@ class MP4Demuxer implements Demuxer {
   }
 
   public resetContiguity(): void {
-    this.remainderData = null;
+    this.resetProgressiveState();
   }
 
   static probe(data: Uint8Array) {
@@ -125,26 +141,66 @@ class MP4Demuxer implements Demuxer {
     let videoSamples = data;
     const videoTrack = this.videoTrack as PassthroughTrack;
     const textTrack = this.txtTrack as DemuxedUserdataTrack;
+    let parseFragment = true;
     if (this.config.progressive) {
-      // Split the bytestream into two ranges: one encompassing all data up until the start of the last moof, and everything else.
-      // This is done to guarantee that we're sending valid data to MSE - when demuxing progressively, we have no guarantee
-      // that the fetch loader gives us flush moof+mdat pairs. If we push jagged data to MSE, it will throw an exception.
-      if (this.remainderData) {
-        videoSamples = appendUint8Array(this.remainderData, data);
+      if (this.progressiveMdatPending) {
+        // Do not include bytes from the next top-level box in this pair
+        const remainingMdatLength = Math.max(
+          this.progressiveMdatEnd - this.progressiveOffset,
+          0,
+        );
+        const outputLength = Math.min(data.byteLength, remainingMdatLength);
+        videoTrack.samples =
+          outputLength === data.byteLength ? data : data.slice(0, outputLength);
+        if (outputLength < data.byteLength) {
+          this.remainderData = data.slice(outputLength);
+        }
+        textTrack.samples = this.consumeProgressiveSamples(
+          videoTrack.samples,
+          true,
+        );
+        if (this.progressiveOffset >= this.progressiveMdatEnd) {
+          this.progressiveMdatPending = false;
+        }
+        parseFragment = false;
+      } else {
+        // Hold box headers until a complete moof and mdat header can be parsed
+        if (this.remainderData) {
+          videoSamples = appendUint8Array(this.remainderData, data);
+        }
+        const allowIncompleteMdat =
+          this.initData !== undefined &&
+          chunkMeta !== undefined &&
+          !chunkMeta.iframe;
+        const segmentedData = segmentValidRange(
+          videoSamples,
+          allowIncompleteMdat,
+        );
+        this.remainderData = segmentedData.remainder;
+        videoTrack.samples = segmentedData.valid || new Uint8Array();
+        if (
+          allowIncompleteMdat &&
+          videoTrack.samples.byteLength > 0 &&
+          segmentedData.mdatEnd !== null
+        ) {
+          this.resetProgressiveSampleState();
+          this.progressiveMdatEnd = segmentedData.mdatEnd;
+          this.progressiveMdatPending =
+            this.progressiveMdatEnd > videoTrack.samples.byteLength;
+        }
       }
-      const segmentedData = segmentValidRange(videoSamples);
-      this.remainderData = segmentedData.remainder;
-      videoTrack.samples = segmentedData.valid || new Uint8Array();
     } else {
       videoTrack.samples = videoSamples;
     }
-    const id3Track = this.extractID3Track(videoTrack, timeOffset);
-    const sampleData = this.parseFragment(
-      videoTrack,
-      textTrack,
-      timeOffset,
-      chunkMeta,
-    );
+    const id3Track = parseFragment
+      ? this.extractID3Track(videoTrack, timeOffset)
+      : (this.id3Track as DemuxedMetadataTrack);
+    const sampleData = parseFragment
+      ? this.parseFragment(videoTrack, textTrack, timeOffset, chunkMeta)
+      : this.progressiveSampleData;
+    if (this.progressiveMdatPending && sampleData) {
+      this.progressiveSampleData = sampleData;
+    }
 
     return {
       videoTrack,
@@ -170,6 +226,7 @@ class MP4Demuxer implements Demuxer {
       timeOffset,
       chunkMeta,
     );
+    this.resetProgressiveState();
 
     return {
       videoTrack,
@@ -189,17 +246,150 @@ class MP4Demuxer implements Demuxer {
   ): ParsedSampleData | undefined {
     const initData = this.initData;
     if (initData && chunkMeta) {
-      const { samples, sampleData } = parseSamplesAndTiming(
+      const includeProgressiveSamples =
+        this.progressiveMdatPending && !initData.video?.encrypted;
+      const { progressiveSamples, samples, sampleData } = parseSamplesAndTiming(
         timeOffset,
         videoTrack,
         initData,
         this.logger,
         __USE_IFRAMES__ && chunkMeta.iframe,
+        includeProgressiveSamples,
       );
       textTrack.samples = samples;
+      if (progressiveSamples) {
+        this.initializeProgressiveSamples(progressiveSamples, videoTrack);
+      }
       return sampleData;
     }
     textTrack.samples = parseSamples(timeOffset, videoTrack);
+  }
+
+  private resetProgressiveState(): void {
+    this.remainderData = null;
+    this.progressiveMdatPending = false;
+    this.progressiveMdatEnd = 0;
+    this.resetProgressiveSampleState();
+  }
+
+  private resetProgressiveSampleState(): void {
+    this.progressiveSampleData = undefined;
+    this.progressiveSamples = [];
+    this.progressiveSampleIndex = 0;
+    this.progressiveSampleParts = [];
+    this.progressiveSamplePartsLength = 0;
+    this.progressiveSampleSkipped = false;
+    this.progressiveOffset = 0;
+    this.progressiveIsHEVC = false;
+  }
+
+  private initializeProgressiveSamples(
+    samples: ProgressiveVideoSample[],
+    videoTrack: PassthroughTrack,
+  ): void {
+    // Complete samples were scanned above. Retain only an incomplete sample
+    // prefix so that SEI messages split across network chunks are not lost
+    const progressiveSamples: ProgressiveVideoSample[] = [];
+    for (let index = 0; index < samples.length; index++) {
+      const sample = samples[index];
+      if (
+        Number.isSafeInteger(sample.start) &&
+        Number.isSafeInteger(sample.end) &&
+        sample.start >= 0 &&
+        sample.end > sample.start
+      ) {
+        progressiveSamples.push(sample);
+      }
+    }
+    progressiveSamples.sort((first, second) => first.start - second.start);
+    this.progressiveSamples = progressiveSamples;
+    this.progressiveIsHEVC = isHEVC(videoTrack.codec);
+    this.consumeProgressiveSamples(videoTrack.samples, false);
+  }
+
+  private consumeProgressiveSamples(
+    data: Uint8Array<ArrayBuffer>,
+    parseCompletedSamples: boolean,
+  ): DemuxedUserdataTrack['samples'] {
+    const userdataSamples: DemuxedUserdataTrack['samples'] = [];
+    const dataStart = this.progressiveOffset;
+    const dataEnd = dataStart + data.byteLength;
+
+    while (this.progressiveSampleIndex < this.progressiveSamples.length) {
+      const sample = this.progressiveSamples[this.progressiveSampleIndex];
+      if (sample.end <= dataStart) {
+        this.resetProgressiveSampleParts();
+        this.progressiveSampleIndex++;
+        continue;
+      }
+      if (sample.start >= dataEnd) {
+        break;
+      }
+
+      const overlapStart = Math.max(sample.start, dataStart);
+      const overlapEnd = Math.min(sample.end, dataEnd);
+      const dataOffset = overlapStart - dataStart;
+      const overlapLength = overlapEnd - overlapStart;
+      const completeSampleInData =
+        overlapStart === sample.start && overlapEnd === sample.end;
+
+      if (completeSampleInData && this.progressiveSamplePartsLength === 0) {
+        if (parseCompletedSamples) {
+          parseSEIFromSample(
+            data,
+            dataOffset,
+            dataOffset + overlapLength,
+            this.progressiveIsHEVC,
+            sample.pts,
+            userdataSamples,
+          );
+        }
+        this.progressiveSampleIndex++;
+        continue;
+      }
+
+      if (
+        this.progressiveSamplePartsLength === 0 &&
+        overlapStart > sample.start
+      ) {
+        this.progressiveSampleSkipped = true;
+      }
+      if (!this.progressiveSampleSkipped && overlapLength > 0) {
+        const samplePart = data.slice(dataOffset, dataOffset + overlapLength);
+        this.progressiveSampleParts.push(samplePart);
+        this.progressiveSamplePartsLength += samplePart.byteLength;
+      }
+
+      if (overlapEnd < sample.end) {
+        break;
+      }
+
+      if (parseCompletedSamples && !this.progressiveSampleSkipped) {
+        const sampleData = concatUint8Arrays(
+          this.progressiveSampleParts,
+          this.progressiveSamplePartsLength,
+        );
+        parseSEIFromSample(
+          sampleData,
+          0,
+          sampleData.byteLength,
+          this.progressiveIsHEVC,
+          sample.pts,
+          userdataSamples,
+        );
+      }
+      this.resetProgressiveSampleParts();
+      this.progressiveSampleIndex++;
+    }
+
+    this.progressiveOffset = dataEnd;
+    return userdataSamples;
+  }
+
+  private resetProgressiveSampleParts(): void {
+    this.progressiveSampleParts = [];
+    this.progressiveSamplePartsLength = 0;
+    this.progressiveSampleSkipped = false;
   }
 
   private extractID3Track(
@@ -265,7 +455,7 @@ class MP4Demuxer implements Demuxer {
   destroy() {
     // @ts-ignore
     this.config = null;
-    this.remainderData = null;
+    this.resetProgressiveState();
     this.videoTrack =
       this.audioTrack =
       this.id3Track =
@@ -283,6 +473,20 @@ function getEmsgStartTime(
     ? (emsgInfo.presentationTime as number) / emsgInfo.timeScale
     : timeOffset +
         (emsgInfo.presentationTimeDelta as number) / emsgInfo.timeScale;
+}
+
+function concatUint8Arrays(
+  arrays: Uint8Array<ArrayBuffer>[],
+  totalLength: number,
+): Uint8Array<ArrayBuffer> {
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (let index = 0; index < arrays.length; index++) {
+    const data = arrays[index];
+    result.set(data, offset);
+    offset += data.byteLength;
+  }
+  return result;
 }
 
 export default MP4Demuxer;

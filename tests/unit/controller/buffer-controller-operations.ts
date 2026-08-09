@@ -225,6 +225,54 @@ describe('BufferController with attached media', function () {
     });
   });
 
+  it('clears quota recovery state when resetting the operation queue', function () {
+    (bufferController as any)._quotaEvictionPending.video = true;
+
+    (bufferController as any).resetQueue();
+
+    expect((bufferController as any)._quotaEvictionPending).to.deep.equal({});
+    expect((bufferController as any).operationQueue).to.not.equal(
+      operationQueue,
+    );
+  });
+
+  it('resets progressive parser state after a terminal append error', function () {
+    hls.config.progressive = true;
+    const buffer = getSourceBufferTrack(bufferController, 'video')
+      ?.buffer as unknown as MockSourceBuffer;
+    buffer.appendBuffer.onSecondCall().throws(new Error('append failed'));
+    const frag = new Fragment(PlaylistLevelType.MAIN, '');
+    frag.level = 0;
+    frag.sn = 1;
+
+    for (let chunkIndex = 1; chunkIndex <= 3; chunkIndex++) {
+      const segmentData = new Uint8Array([chunkIndex]);
+      hls.trigger(Events.BUFFER_APPENDING, {
+        parent: PlaylistLevelType.MAIN,
+        type: 'video',
+        data: segmentData,
+        frag,
+        part: null,
+        chunkMeta: new ChunkMetadata(0, 1, chunkIndex, segmentData.byteLength),
+      });
+    }
+
+    buffer.dispatchEvent(new Event('updateend'));
+
+    expect(buffer.appendBuffer).to.have.callCount(2);
+    expect(buffer.abort).to.have.been.calledOnce;
+    expect((bufferController as any).operationQueue).to.equal(operationQueue);
+    expect(operationQueue.current('video')).to.equal(null);
+    const errorEvents = triggerSpy
+      .getCalls()
+      .filter((call) => call.args[0] === Events.ERROR);
+    expect(errorEvents).to.have.lengthOf(1);
+    expect(errorEvents[0].args[1]).to.include({
+      details: ErrorDetails.BUFFER_APPEND_ERROR,
+      sourceBufferName: 'video',
+    });
+  });
+
   describe('onBufferAppending', function () {
     it('should enqueue and execute an append operation', function () {
       const queueAppendSpy = sandbox.spy(operationQueue, 'append');
