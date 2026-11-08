@@ -202,7 +202,10 @@ class AudioStreamController
     const pos = this.getLoadPosition();
     const syncFrag = findNearestWithCC(trackDetails, targetDiscontinuity, pos);
     // Only stop waiting for audioFrag.cc if an audio segment of the same discontinuity domain (cc) is found
-    if (syncFrag) {
+    if (
+      syncFrag &&
+      this.fragmentTracker.getState(syncFrag) !== FragmentState.OK
+    ) {
       this.log(`Syncing with main frag at ${syncFrag.start} cc ${syncFrag.cc}`);
       this.startFragRequested = false;
       this.nextLoadPosition = syncFrag.start;
@@ -311,13 +314,7 @@ class AudioStreamController
   }
 
   protected onTickEnd() {
-    const { media } = this;
-    if (!media?.readyState) {
-      // Exit early if we don't have media or if the media hasn't buffered anything yet (readyState 0)
-      return;
-    }
-
-    this.lastCurrentTime = media.currentTime;
+    super.onTickEnd();
     this.checkFragmentChanged();
   }
 
@@ -796,15 +793,18 @@ class AudioStreamController
       return false;
     }
 
-    const fragPlaying = this.fragPlaying;
-    const fragPreviousLevel = previousFrag?.level;
-    if (!fragPlaying || fragPlaying.level !== fragPreviousLevel) {
-      if (previousFrag) {
-        this.cleanupBackBuffer();
-      }
-      if (this.switchingTrack) {
-        this.completeAudioSwitch(this.switchingTrack);
-      }
+    const { fragPlaying, switchingTrack } = this;
+    const levelChanged =
+      !fragPlaying || fragPlaying.level !== previousFrag?.level;
+    if (levelChanged && previousFrag) {
+      this.cleanupBackBuffer();
+    }
+    // A switch back to the playing track (before any other track was appended) has no level change to detect
+    if (
+      switchingTrack &&
+      (levelChanged || fragPlaying?.level === switchingTrack.id)
+    ) {
+      this.completeAudioSwitch(switchingTrack);
     }
     return true;
   }
@@ -849,6 +849,9 @@ class AudioStreamController
           );
           this.fragmentTracker.addAsGap(data.frag as MediaFragment);
         }
+        break;
+      case ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET:
+        this.onSourceBufferError(PlaylistLevelType.AUDIO, data);
         break;
       case ErrorDetails.BUFFER_ADD_CODEC_ERROR:
       case ErrorDetails.BUFFER_APPEND_ERROR:
@@ -933,7 +936,7 @@ class AudioStreamController
       const bufferFlushDelay = config.nextAudioTrackBufferFlushForwardOffset;
       const startOffset = Math.max(
         this.getLoadPosition() + bufferFlushDelay,
-        frag.start,
+        (part || frag).start,
       );
       super.flushMainBuffer(
         startOffset,

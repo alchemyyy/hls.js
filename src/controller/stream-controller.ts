@@ -236,9 +236,6 @@ export default class StreamController
 
   protected onTickEnd() {
     super.onTickEnd();
-    if (this.media?.readyState && this.media.seeking === false) {
-      this.lastCurrentTime = this.media.currentTime;
-    }
     this.checkFragmentChanged();
   }
 
@@ -277,7 +274,11 @@ export default class StreamController
     }
 
     const lastDetails = this.getLevelDetails();
-    if (lastDetails && this._streamEnded(bufferInfo, lastDetails)) {
+    if (
+      lastDetails &&
+      this._streamEnded(bufferInfo, lastDetails) &&
+      this.altAudio !== AlternateAudio.SWITCHING
+    ) {
       const data: BufferEOSData = {
         type: this.targetBufferType(),
       };
@@ -995,8 +996,8 @@ export default class StreamController
       return;
     }
     if (!this._hasEnoughToStart && BufferHelper.getBuffered(media).length) {
-      this._hasEnoughToStart = true;
       this.seekToStartPos();
+      this._hasEnoughToStart = true;
     }
     if (bufferedMainFragment) {
       this.tick();
@@ -1047,6 +1048,9 @@ export default class StreamController
           );
           this.fragmentTracker.addAsGap(data.frag as MediaFragment);
         }
+        break;
+      case ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET:
+        this.onSourceBufferError(PlaylistLevelType.MAIN, data);
         break;
       case ErrorDetails.BUFFER_ADD_CODEC_ERROR:
       case ErrorDetails.BUFFER_APPEND_ERROR:

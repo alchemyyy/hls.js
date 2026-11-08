@@ -592,6 +592,8 @@ export class BaseStreamController extends TaskLoop implements NetworkComponentAP
     // (undocumented)
     protected onMediaSeeking: () => void;
     // (undocumented)
+    protected onSourceBufferError(filterType: PlaylistLevelType, data: ErrorData): void;
+    // (undocumented)
     protected onTickEnd(): void;
     // (undocumented)
     pauseBuffering(): void;
@@ -1338,6 +1340,7 @@ export type EMEControllerConfig = {
     drmSystemOptions: DRMSystemOptions | undefined;
     requestMediaKeySystemAccessFunc: MediaKeyFunc | null;
     requireKeySystemAccessOnStart: boolean;
+    reuseKeySessions: boolean;
 };
 
 // Warning: (ae-missing-release-tag) "EncryptedFragment" is part of the package's API, but it is missing a release tag (@alpha, @beta, @public, or @internal)
@@ -2130,6 +2133,7 @@ export class FragmentTracker implements ComponentAPI {
     detectPartialFragments(data: FragBufferedData): void;
     // (undocumented)
     fragBuffered(frag: MediaFragment, force?: true): FragmentEntity | undefined;
+    gapFragments(): MediaFragment[];
     getAppendedFrag(position: number, levelType: PlaylistLevelType): MediaFragment | Part | null;
     getBackBufferEvictionEnd(beforePosition: number, levelType: PlaylistLevelType, bytesNeeded: number): number;
     getBufferedFrag(position: number, levelType: PlaylistLevelType): MediaFragment | null;
@@ -3634,6 +3638,8 @@ export class LevelDetails {
     // (undocumented)
     partList: Part[] | null;
     // (undocumented)
+    get partsExpired(): boolean;
+    // (undocumented)
     partTarget: number;
     // (undocumented)
     playlistParsingError: Error | null;
@@ -3800,6 +3806,8 @@ export interface LevelPTSUpdatedData {
     frag: Fragment;
     // (undocumented)
     level: Level;
+    // (undocumented)
+    part: Part | null;
     // (undocumented)
     start: number;
     // (undocumented)

@@ -148,6 +148,7 @@ See [API Reference](https://hlsjs-dev.video-dev.org/api-docs/) for a complete li
   - [`drmSystemOptions`](#drmsystemoptions)
   - [`requestMediaKeySystemAccessFunc`](#requestmediakeysystemaccessfunc)
   - [`requireKeySystemAccessOnStart`](#requirekeysystemaccessonstart)
+  - [`reuseKeySessions`](#reusekeysessions)
   - [`cmcd`](#cmcd)
   - [`enableInterstitialPlayback`](#enableinterstitialplayback)
   - [`interstitialAppendInPlace`](#interstitialappendinplace)
@@ -919,6 +920,20 @@ If you want to have a native Live UI in environments like iOS Safari, Safari, An
 (default `false`)
 
 Set to `true` to use the Managed Media Source API (`ManagedMediaSource` global) instead of the `MediaSource` global when present. By default, `ManagedMediaSource` will only be used as a fallback when `MediaSource` is undefined.
+
+With `ManagedMediaSource`, HLS.js attaches through a `<source>` child element and sets `disableRemotePlayback` on the media element. To enable AirPlay, append a `<source>` with the HLS URL after the MediaSource `<source>` and set `disableRemotePlayback` back to `false` once media is attached:
+
+```js
+hls.on(Hls.Events.MEDIA_ATTACHED, (event, { media }) => {
+  const source = document.createElement('source');
+  source.type = 'application/x-mpegURL';
+  source.src = hlsUrl;
+  media.appendChild(source);
+  media.disableRemotePlayback = false;
+});
+```
+
+When an AirPlay target is selected, Safari closes the MediaSource and loads the source alternative on the remote device. HLS.js detaches from the media element when that happens (see `MEDIA_SOURCE_REQUIRES_RESET`). Call `attachMedia()` and `startLoad()` again when playback returns to the local device. This only works through `ManagedMediaSource`: on macOS and iPadOS, where `MediaSource` is also available, set `preferManagedMediaSource` to `true` to AirPlay from HLS.js.
 
 ### `enableWorker`
 
@@ -1864,6 +1879,12 @@ var hls new Hls({
 When set to `true`, key-system access is requested for the key systems configured in [`drmSystems`](#drmsystems) before loading starts, rather than lazily once an `EXT-X-KEY` or `EXT-X-SESSION-KEY` tag is encountered.
 
 Use this with streams that begin with clear content and transition to encrypted content, where setting up MediaKeys after the first segments have been appended can break decoding. See [#7216](https://github.com/video-dev/hls.js/issues/7216) for the Chrome `PIPELINE_DECODE_ERROR` case this addresses.
+
+### `reuseKeySessions`
+
+(default: `false`)
+
+When set to `true`, key sessions are kept open when `loadSource()` is called again on the same media element, as long as the attached MediaKeys are kept. Keys of the new source that match a key ID in a kept session are loaded from that session, so no new license request is made. Keys that do not match get a new session and license request as usual.
 
 ### `cmcd`
 
@@ -3182,7 +3203,7 @@ Full list of errors is described below:
   - data: { type : `MEDIA_ERROR`, details : `Hls.ErrorDetails.BUFFER_APPENDING_ERROR`, fatal : `false` }
 - `Hls.ErrorDetails.BUFFER_APPEND_NO_PROGRESS` - raised when a full-fragment append cycle completes without increasing the fragment's buffered coverage; after `appendErrorMaxRetry` consecutive cycles the fragment is marked as a gap to prevent loop loading
   - data: { type : `MEDIA_ERROR`, details : `Hls.ErrorDetails.BUFFER_APPEND_NO_PROGRESS`, fatal : `false`, frag : fragment object, appendsWithoutProgress : consecutive count }
-- `Hls.ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET` - raised when MediaSource `readyState` is "ended" or "closed", or the media element has an error, such that the MediaSource must be recreated before appending can continue. `errorAction.flags` include `ResetMediaSource`, so this is recovered by tearing down and re-attaching the MediaSource.
+- `Hls.ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET` - raised when MediaSource `readyState` is "ended" or "closed", or the media element has an error, such that the MediaSource must be recreated before appending can continue. `errorAction.flags` include `ResetMediaSource`, so this is recovered by tearing down and re-attaching the MediaSource. If the MediaSource closed because the media element switched to another source while attached (a third party set `src`, or the browser selected an alternate `<source>` for AirPlay), HLS.js detaches the media element instead of raising this error and `MEDIA_DETACHED` is dispatched; re-attach to resume.
   - data: { type : `MEDIA_ERROR`, details : `Hls.ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET`, fatal : `true` or `false`, error : Error }
 - `Hls.ErrorDetails.BUFFER_STALLED_ERROR` - raised when playback is stuck because buffer is running out of data
   - data: { type : `MEDIA_ERROR`, details : `Hls.ErrorDetails.BUFFER_STALLED_ERROR`, fatal : `true` or `false`, buffer : buffer length (optional) }

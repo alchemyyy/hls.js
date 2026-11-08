@@ -25,6 +25,8 @@ export class MockMediaSource extends EventTarget {
 
 type TimeRange = { start: number; end: number };
 
+type MockMediaKeys = {};
+
 class MockBufferedRanges {
   public _ranges: Array<TimeRange> = [];
   start(index: number) {
@@ -102,9 +104,11 @@ export class MockSourceBuffer extends EventTarget {
 }
 export class MockMediaElement extends EventTarget {
   private __src: string = '';
+  public currentSrc: string = '';
   private __currentTime: number = 0;
   public duration: number = Infinity;
   public textTracks: any[] = [];
+  private __mediaKeys: MockMediaKeys | null = null;
 
   __timeUpdate(value: number) {
     this.__currentTime = value;
@@ -135,5 +139,21 @@ export class MockMediaElement extends EventTarget {
     if (qualifiedName === 'src') {
       this.src = '';
     }
+  }
+  get mediaKeys(): MockMediaKeys | null {
+    return this.__mediaKeys;
+  }
+  setMediaKeys(mediaKeys: MockMediaKeys | null): Promise<void> {
+    if (this.src) {
+      return Promise.reject(
+        // `Fatal error : internalException InvalidStateError: `
+        new Error(
+          `Failed to execute 'setMediaKeys' on 'HTMLMediaElement': The existing ContentDecryptionModule object cannot be removed at this time.`,
+        ),
+      );
+    }
+    return Promise.resolve().then(() => {
+      this.__mediaKeys = mediaKeys;
+    });
   }
 }

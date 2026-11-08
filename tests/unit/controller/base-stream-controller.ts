@@ -3,6 +3,8 @@ import sinon from 'sinon';
 import sinonChai from 'sinon-chai';
 import { hlsDefaultConfig } from '../../../src/config';
 import { State } from '../../../src/controller/base-stream-controller';
+import { SOURCE_BUFFER_ERROR_NAME } from '../../../src/controller/buffer-controller';
+import { FragmentState } from '../../../src/controller/fragment-tracker';
 import BaseStreamControllerImpl from '../../../src/controller/stream-controller';
 import { ErrorDetails, ErrorTypes } from '../../../src/errors';
 import Hls from '../../../src/hls';
@@ -16,6 +18,7 @@ import { BufferHelper } from '../../../src/utils/buffer-helper';
 import { TimeRangesMock } from '../../mocks/time-ranges.mock';
 import type BaseStreamController from '../../../src/controller/base-stream-controller';
 import type { MediaFragment, Part } from '../../../src/loader/fragment';
+import type { ErrorData } from '../../../src/types/events';
 import type { BufferInfo } from '../../../src/utils/buffer-helper';
 
 use(sinonChai);
@@ -38,6 +41,7 @@ type BaseStreamControllerTestable = Omit<
   | 'fragPrevious'
   | 'tickImmediate'
   | 'hls'
+  | 'onSourceBufferError'
 > & {
   media: HTMLMediaElement | null;
   _streamEnded: (bufferInfo: BufferInfo, levelDetails: LevelDetails) => boolean;
@@ -60,6 +64,7 @@ type BaseStreamControllerTestable = Omit<
   fragPrevious: MediaFragment | null;
   tickImmediate: () => void;
   hls: Hls;
+  onSourceBufferError: (filterType: PlaylistLevelType, data: ErrorData) => void;
 };
 
 describe('BaseStreamController', function () {
@@ -78,6 +83,7 @@ describe('BaseStreamController', function () {
       isEndListAppended() {
         return true;
       },
+      addAsGap: sinon.spy(),
       removeFragmentsInRange: sinon.spy(),
     };
     baseStreamController = new BaseStreamControllerImpl(
@@ -114,6 +120,32 @@ describe('BaseStreamController', function () {
     }
     details.live = live;
     return details;
+  }
+
+  function refuse(frag: Fragment, part: Part | null = null) {
+    // only fragments of a live playlist are marked
+    const levels: unknown[] = [];
+    levels[frag.level] = { details: { live: true, fragments: [] } };
+    (baseStreamController as any).levels = levels;
+    const error = new Error(
+      'video SourceBuffer error. MediaSource readyState: ended',
+    );
+    error.name = SOURCE_BUFFER_ERROR_NAME;
+    baseStreamController.onSourceBufferError(PlaylistLevelType.MAIN, {
+      type: ErrorTypes.MEDIA_ERROR,
+      details: ErrorDetails.MEDIA_SOURCE_REQUIRES_RESET,
+      fatal: false,
+      error,
+      frag,
+      part,
+    });
+  }
+
+  function mainFrag(sn: number, level: number): MediaFragment {
+    const frag = new Fragment(PlaylistLevelType.MAIN, '') as MediaFragment;
+    frag.sn = sn;
+    frag.level = level;
+    return frag;
   }
 
   describe('_streamEnded', function () {
@@ -161,15 +193,33 @@ describe('BaseStreamController', function () {
     });
   });
 
+  describe('onSourceBufferError', function () {
+    it('marks the fragment of a refused part', function () {
+      const frag = mainFrag(1, 0);
+      const part = { index: 1, fragment: frag, gap: false } as unknown as Part;
+      refuse(frag, part);
+      expect(fragmentTracker.addAsGap).to.have.been.calledOnceWith(frag);
+      expect(part.gap).to.equal(false);
+    });
+  });
+
   describe('Seeking Logic', function () {
     describe('onMediaSeeking', function () {
-      it('should handle backward seek behavior correctly', function () {
+      it('should handle backward seek after media buffered behavior correctly', function () {
+        // Mock hasEnoughToStart to return false:
+        // lastCurrentTime is updated with startPosition and nextLoadPosition before start
+        const hasEnoughToStartStub = sinon
+          .stub(baseStreamController.hls, 'hasEnoughToStart')
+          .get(() => true);
+
         // Setup initial state for backward seek
         baseStreamController.lastCurrentTime = 10.5;
         media.currentTime = 5.2;
 
         // Call onMediaSeeking - should execute without error
         expect(() => baseStreamController.onMediaSeeking()).to.not.throw();
+
+        hasEnoughToStartStub.restore();
 
         // Verify lastCurrentTime is not updated on backward seek
         expect(baseStreamController.lastCurrentTime).to.equal(10.5);
@@ -214,7 +264,54 @@ describe('BaseStreamController', function () {
         resetSpy.restore();
       });
 
+      it('keeps gaps on a seek before hasEnoughToStart and removes them once it is set', function () {
+        const hasEnoughToStart = sinon.stub(hls, 'hasEnoughToStart');
+        media.currentTime = 10.0;
+
+        hasEnoughToStart.get(() => false);
+        baseStreamController.onMediaSeeking();
+        expect(
+          fragmentTracker.removeFragmentsInRange,
+          'the seek to the start position keeps them',
+        ).to.have.not.been.called;
+
+        hasEnoughToStart.get(() => true);
+        media.currentTime = 12.0;
+        baseStreamController.onMediaSeeking();
+        expect(
+          fragmentTracker.removeFragmentsInRange,
+          'a later seek out of the buffer removes them',
+        ).to.have.been.calledOnce;
+      });
+
+      it('keeps gaps on the seek to the start position that lands outside the buffer', function () {
+        sinon.stub(hls, 'hasEnoughToStart').get(() => true);
+        baseStreamController.startPosition = 10.0;
+        media.buffered = new TimeRangesMock([14, 20]);
+        media.currentTime = 10.0;
+
+        baseStreamController.onMediaSeeking();
+        expect(fragmentTracker.removeFragmentsInRange).to.have.not.been.called;
+
+        media.currentTime = 11.0;
+        baseStreamController.onMediaSeeking();
+        expect(
+          fragmentTracker.removeFragmentsInRange,
+          'a seek elsewhere out of the buffer removes them',
+        ).to.have.been.calledOnce;
+      });
+
+      it('keeps gaps on a seek into the buffer', function () {
+        sinon.stub(hls, 'hasEnoughToStart').get(() => true);
+        media.buffered = new TimeRangesMock([5, 20]);
+        media.currentTime = 10.0;
+
+        baseStreamController.onMediaSeeking();
+        expect(fragmentTracker.removeFragmentsInRange).to.have.not.been.called;
+      });
+
       it('should call fragmentTracker.removeFragmentsInRange when media exists', function () {
+        sinon.stub(hls, 'hasEnoughToStart').get(() => true);
         baseStreamController.lastCurrentTime = 5.0;
         media.currentTime = 10.0;
 
@@ -422,7 +519,7 @@ describe('BaseStreamController', function () {
           stats: {
             loading: { first: 100 },
             total: 1000000,
-            loaded: 900000, // Nearly complete (100k bits remaining = 0.1s < 0.15s)
+            loaded: 990000, // Nearly complete (10k bytes remaining = 0.08s < 0.15s)
           },
         } as any;
         baseStreamController.config.abrEwmaDefaultEstimate = 1000000;
@@ -710,9 +807,7 @@ describe('BaseStreamController', function () {
           PlaylistLevelType.MAIN,
           'http://example.com/segment.ts',
         ) as MediaFragment;
-        // The code treats bandwidth as bytes/sec for this calculation (despite being labeled as bps in config)
-        // For 1Mbps = 1,000,000 bits/s = 125,000 bytes/s
-        // To complete in 0.15s: need 0.15 * 125,000 = 18,750 bytes
+        // At 1Mbps, 0.15s = 150,000 bits = 18,750 bytes
         // So: total = 1,000,000 bytes, loaded = 981,250 bytes, remaining = 18,750 bytes
         mockFrag.loader = {
           stats: {
@@ -722,10 +817,9 @@ describe('BaseStreamController', function () {
           },
         } as any;
 
-        // Set bandwidth to bytes/sec: 1Mbps = 125,000 bytes/s
-        baseStreamController.config.abrEwmaDefaultEstimate = 125000; // 1Mbps in bytes/sec
+        baseStreamController.config.abrEwmaDefaultEstimate = 1000000; // 1Mbps
         baseStreamController.hls.bandwidthEstimate = NaN; // Use default
-        // Time = 18,750 / 125,000 = 0.15s
+        // Time = 18,750 * 8 / 1,000,000 = 0.15s
 
         const result =
           baseStreamController.isFragmentNearlyDownloaded(mockFrag);
@@ -737,9 +831,7 @@ describe('BaseStreamController', function () {
           PlaylistLevelType.MAIN,
           'http://example.com/segment.ts',
         ) as MediaFragment;
-        // The code treats bandwidth as bytes/sec for this calculation (despite being labeled as bps in config)
-        // For 1Mbps = 1,000,000 bits/s = 125,000 bytes/s
-        // To exceed 0.15s: need > 0.15 * 125,000 = > 18,750 bytes
+        // At 1Mbps, more than 18,750 bytes takes > 0.15s
         // So: total = 1,000,000 bytes, loaded = 981,249 bytes, remaining = 18,751 bytes
         mockFrag.loader = {
           stats: {
@@ -749,10 +841,9 @@ describe('BaseStreamController', function () {
           },
         } as any;
 
-        // Set bandwidth to bytes/sec: 1Mbps = 125,000 bytes/s
-        baseStreamController.config.abrEwmaDefaultEstimate = 125000; // 1Mbps in bytes/sec
+        baseStreamController.config.abrEwmaDefaultEstimate = 1000000; // 1Mbps
         baseStreamController.hls.bandwidthEstimate = NaN; // Use default
-        // Time = 18,751 / 125,000 = 0.150008s (> 0.15)
+        // Time = 18,751 * 8 / 1,000,000 = 0.150008s (> 0.15)
 
         const result =
           baseStreamController.isFragmentNearlyDownloaded(mockFrag);
@@ -764,23 +855,21 @@ describe('BaseStreamController', function () {
           PlaylistLevelType.MAIN,
           'http://example.com/segment.ts',
         ) as MediaFragment;
-        // Set up to complete in 0.10 seconds with bandwidthEstimate
-        // The code treats bandwidth as bytes/sec: 2Mbps = 250,000 bytes/s
-        // To complete in 0.10s: need 0.10 * 250,000 = 25,000 bytes
+        // At 2Mbps, 0.10s = 25,000 bytes
         mockFrag.loader = {
           stats: {
             loading: { first: 100 },
             total: 1000000, // 1MB in bytes
-            loaded: 975000, // 25,000 bytes remaining = 0.10s at 2Mbps (250k bytes/s)
+            loaded: 975000, // 25,000 bytes remaining = 0.10s at 2Mbps
           },
         } as any;
 
-        baseStreamController.hls.bandwidthEstimate = 250000; // 2Mbps in bytes/sec
-        baseStreamController.config.abrEwmaDefaultEstimate = 125000; // 1Mbps in bytes/sec (should not be used)
+        baseStreamController.hls.bandwidthEstimate = 2000000; // 2Mbps
+        baseStreamController.config.abrEwmaDefaultEstimate = 1000000; // 1Mbps (0.2s, should not be used)
 
         const result =
           baseStreamController.isFragmentNearlyDownloaded(mockFrag);
-        // With 2Mbps: 25,000 / 250,000 = 0.10s (< 0.15) -> true
+        // With 2Mbps: 25,000 * 8 / 2,000,000 = 0.10s (< 0.15) -> true
         expect(result).to.be.true;
       });
 
@@ -789,23 +878,21 @@ describe('BaseStreamController', function () {
           PlaylistLevelType.MAIN,
           'http://example.com/segment.ts',
         ) as MediaFragment;
-        // Set up to complete in 0.10 seconds with default estimate
-        // The code treats bandwidth as bytes/sec: 1Mbps = 125,000 bytes/s
-        // To complete in 0.10s: need 0.10 * 125,000 = 12,500 bytes
+        // At 1Mbps, 0.10s = 12,500 bytes
         mockFrag.loader = {
           stats: {
             loading: { first: 100 },
             total: 1000000, // 1MB in bytes
-            loaded: 987500, // 12,500 bytes remaining = 0.10s at 1Mbps (125k bytes/s)
+            loaded: 987500, // 12,500 bytes remaining = 0.10s at 1Mbps
           },
         } as any;
 
         baseStreamController.hls.bandwidthEstimate = Infinity; // Not finite
-        baseStreamController.config.abrEwmaDefaultEstimate = 125000; // 1Mbps in bytes/sec (should be used)
+        baseStreamController.config.abrEwmaDefaultEstimate = 1000000; // 1Mbps (should be used)
 
         const result =
           baseStreamController.isFragmentNearlyDownloaded(mockFrag);
-        // With 1Mbps default: 12,500 / 125,000 = 0.10s (< 0.15) -> true
+        // With 1Mbps default: 12,500 * 8 / 1,000,000 = 0.10s (< 0.15) -> true
         expect(result).to.be.true;
       });
 
@@ -835,23 +922,21 @@ describe('BaseStreamController', function () {
           PlaylistLevelType.MAIN,
           'http://example.com/segment.ts',
         ) as MediaFragment;
-        // Set up to complete in 0.10 seconds with default estimate
-        // The code treats bandwidth as bytes/sec: 1Mbps = 125,000 bytes/s
-        // To complete in 0.10s: need 0.10 * 125,000 = 12,500 bytes
+        // At 1Mbps, 0.10s = 12,500 bytes
         mockFrag.loader = {
           stats: {
             loading: { first: 100 },
             total: 1000000, // 1MB in bytes
-            loaded: 987500, // 12,500 bytes remaining = 0.10s at 1Mbps (125k bytes/s)
+            loaded: 987500, // 12,500 bytes remaining = 0.10s at 1Mbps
           },
         } as any;
 
+        baseStreamController.config.abrEwmaDefaultEstimate = 1000000; // 1Mbps (should be used)
         baseStreamController.hls.bandwidthEstimate = NaN; // Not finite
-        baseStreamController.config.abrEwmaDefaultEstimate = 125000; // 1Mbps in bytes/sec (should be used)
 
         const result =
           baseStreamController.isFragmentNearlyDownloaded(mockFrag);
-        // With 1Mbps default: 12,500 / 125,000 = 0.10s (< 0.15) -> true
+        // With 1Mbps default: 12,500 * 8 / 1,000,000 = 0.10s (< 0.15) -> true
         expect(result).to.be.true;
       });
 
@@ -865,12 +950,12 @@ describe('BaseStreamController', function () {
           stats: {
             loading: { first: 100 },
             total: 1000000,
-            loaded: 10000, // 990000 bits remaining
+            loaded: 10000, // 990,000 bytes remaining
           },
         } as any;
 
         baseStreamController.config.abrEwmaDefaultEstimate = 100000; // 100Kbps (low)
-        // Time = 990000 / 100000 = 9.9 seconds (> 0.15)
+        // Time = 990,000 * 8 / 100,000 = 79.2 seconds (> 0.15)
 
         const result =
           baseStreamController.isFragmentNearlyDownloaded(mockFrag);
@@ -957,7 +1042,7 @@ describe('BaseStreamController', function () {
         (baseStreamController as any).fragmentLoader,
         'abort',
       );
-      const handleFragLoadErrorStub = sinon.stub(
+      const handleFragLoadErrorSpy = sinon.spy(
         baseStreamController as any,
         'handleFragLoadError',
       );
@@ -965,6 +1050,7 @@ describe('BaseStreamController', function () {
         baseStreamController as any,
         'resetFragmentLoading',
       );
+      const triggerSpy = sinon.spy(baseStreamController.hls, 'trigger');
 
       const result = (baseStreamController as any).loadInitSegmentIfNeeded(
         mediaFrag,
@@ -977,12 +1063,14 @@ describe('BaseStreamController', function () {
         })
         .catch((error) => {
           expect(error).to.equal(loadError);
-          expect(loadError.data.frag).to.equal(mediaFrag);
+          expect(loadError.data.frag).to.equal(initSegment);
           expect(abortStub).to.have.been.calledOnce;
-          expect(handleFragLoadErrorStub).to.have.been.calledOnceWith(
+          expect(handleFragLoadErrorSpy).to.have.been.calledOnceWith(
             loadError,
+            mediaFrag,
           );
-          expect(handleFragLoadErrorStub.firstCall.args[0].data.frag).to.equal(
+          expect(triggerSpy).to.have.been.calledOnceWith('hlsError');
+          expect((triggerSpy.firstCall?.args[1] as ErrorData)?.frag).to.equal(
             mediaFrag,
           );
           expect(resetFragmentLoadingStub).to.have.been.calledOnceWith(
@@ -991,8 +1079,9 @@ describe('BaseStreamController', function () {
         })
         .finally(() => {
           abortStub.restore();
-          handleFragLoadErrorStub.restore();
+          handleFragLoadErrorSpy.restore();
           resetFragmentLoadingStub.restore();
+          triggerSpy.restore();
         });
     });
 
@@ -1023,7 +1112,7 @@ describe('BaseStreamController', function () {
 
       return initDataPromise
         .catch((error) =>
-          (baseStreamController as any).handleFragLoadError(error),
+          (baseStreamController as any).handleFragLoadError(error, initSegment),
         )
         .then(() => {
           const fatalInternalException = errorSpy
@@ -1038,6 +1127,62 @@ describe('BaseStreamController', function () {
             'init-segment load abort must not be reported as a fatal INTERNAL_EXCEPTION',
           ).to.equal(false);
         });
+    });
+  });
+
+  describe('fragment load aborted by stopLoad', function () {
+    function abortedLoadError(frag: MediaFragment) {
+      frag.stats.aborted = true;
+      return new LoadError({
+        type: ErrorTypes.NETWORK_ERROR,
+        details: ErrorDetails.INTERNAL_ABORTED,
+        fatal: false,
+        error: new Error('Fragment load aborted'),
+        frag,
+        networkDetails: null,
+      });
+    }
+
+    beforeEach(function () {
+      (baseStreamController as any).transmuxer = {
+        reset: sinon.spy(),
+        destroy: sinon.spy(),
+      };
+    });
+
+    it('stays STOPPED when the aborted load is handled after stopLoad()', function () {
+      const frag = new Fragment(
+        PlaylistLevelType.MAIN,
+        'segment.ts',
+      ) as MediaFragment;
+      frag.sn = 1;
+      baseStreamController.fragCurrent = frag;
+      baseStreamController.state = State.FRAG_LOADING;
+
+      baseStreamController.stopLoad();
+      (baseStreamController as any).handleFragLoadError(
+        abortedLoadError(frag),
+        frag,
+      );
+
+      expect(baseStreamController.state).to.equal(State.STOPPED);
+    });
+
+    it('still returns to IDLE when an aborted load is handled while loading', function () {
+      const frag = new Fragment(
+        PlaylistLevelType.MAIN,
+        'segment.ts',
+      ) as MediaFragment;
+      frag.sn = 1;
+      baseStreamController.fragCurrent = frag;
+      baseStreamController.state = State.FRAG_LOADING;
+
+      (baseStreamController as any).handleFragLoadError(
+        abortedLoadError(frag),
+        frag,
+      );
+
+      expect(baseStreamController.state).to.equal(State.IDLE);
     });
   });
 
@@ -1238,6 +1383,7 @@ describe('BaseStreamController', function () {
     it('should update nextLoadPosition to current load position', function () {
       baseStreamController.fragCurrent = mockFrag;
       media.currentTime = 15;
+      baseStreamController.lastCurrentTime = 10;
       baseStreamController.nextLoadPosition = 10;
 
       (baseStreamController as any).abortCurrentFrag();
@@ -1492,6 +1638,67 @@ describe('BaseStreamController', function () {
 
       expect((baseStreamController as any).scheduleTrackSwitch).to.not.have.been
         .called;
+    });
+  });
+
+  describe('getFragmentAtPosition', function () {
+    const makeFrag = (sn: number, start: number, duration: number) => {
+      const frag = new Fragment(PlaylistLevelType.MAIN, '') as MediaFragment;
+      frag.sn = sn;
+      frag.duration = duration;
+      frag.setStart(start);
+      return frag;
+    };
+
+    it('does not skip the unloaded tail of a segment when loading parts', function () {
+      // Segment 1 was refreshed by a playlist reload and has a 0.1s unloaded
+      // tail, which is less than maxFragLookUpTolerance (0.25s).
+      const previous = makeFrag(1, 0, 3.9);
+      const current = makeFrag(1, 0, 4);
+      const hint = makeFrag(2, 4, 2);
+      const details = new LevelDetails('');
+      details.live = true;
+      details.startSN = details.endSN = 1;
+      details.fragments = [current];
+      details.fragmentHint = hint;
+      details.partList = [{ fragment: current }, { fragment: hint }] as Part[];
+      fragmentTracker.state = FragmentState.PARTIAL;
+      media.paused = false;
+      const controller = baseStreamController as any;
+      controller.fragPrevious = previous;
+      controller.loadingParts = true;
+      controller.startFragRequested = true;
+
+      expect(controller.getFragmentAtPosition(3.9, 6, details)).to.equal(
+        current,
+      );
+    });
+
+    it('advances to the fragment hint when buffered just short of a refreshed segment with all parts loaded', function () {
+      const previous = makeFrag(1, 20, 2);
+      const current = makeFrag(1, 20, 2);
+      const hint = makeFrag(2, 22, 1);
+      const details = new LevelDetails('');
+      details.live = true;
+      details.startSN = details.endSN = 1;
+      details.fragments = [current];
+      details.fragmentHint = hint;
+      details.partList = [
+        { fragment: current, loaded: true },
+        { fragment: current, loaded: true },
+        { fragment: hint, loaded: false },
+      ] as Part[];
+      fragmentTracker.getState = (frag: MediaFragment) =>
+        frag.sn === 1 ? FragmentState.OK : FragmentState.NOT_LOADED;
+      media.paused = false;
+      const controller = baseStreamController as any;
+      controller.fragPrevious = previous;
+      controller.loadingParts = true;
+      controller.startFragRequested = true;
+
+      expect(controller.getFragmentAtPosition(21.999999, 23, details)).to.equal(
+        hint,
+      );
     });
   });
 });
